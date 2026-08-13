@@ -67,8 +67,17 @@
       </p>
     </details>
     <script>
+      const embeddedMode = new URLSearchParams(location.search).get("embed") === "1";
+
+      function emitHostEvent(type, detail = {}) {
+        dispatchEvent(new CustomEvent(`lowland:${type}`, { detail }));
+      }
+
       function reportError(error) {
-        alert(`${error}`);
+        const message = `${error}`;
+        emitHostEvent("fatal", { message });
+        if (embeddedMode) console.error(error);
+        else alert(message);
       }
 
       addEventListener("error", (event) => reportError(event.error));
@@ -113,13 +122,19 @@
       import { BrowserFS } from "@lowland/guest/browser";
       import { serveGuest } from "./static/__ASSET_DIRECTORY__/bridge-client.js";
 
+      const searchParameters = new URLSearchParams(location.search);
+      const parameters = Object.fromEntries(searchParameters);
+      const embedded = parameters.embed === "1";
+      emitHostEvent("boot-status", { status: "starting" });
+
       // Firefox cannot currently run service workers in the COOP+COEP process
       // used by our module workers, and controlling those workers prevents them
       // from starting. Keep Firefox live-only until Mozilla fixes bug 1613912.
       // https://bugzilla.mozilla.org/show_bug.cgi?id=1613912
-      const persistentInstallSupported = !navigator.userAgent.includes("Firefox/");
+      const persistentInstallSupported =
+        !embedded && !navigator.userAgent.includes("Firefox/");
       let bootMode = persistentInstallSupported ? "__BOOT_MODE__" : "live";
-      if ("serviceWorker" in navigator) {
+      if (!embedded && "serviceWorker" in navigator) {
         if (!persistentInstallSupported) {
           await (await navigator.serviceWorker.getRegistration("/"))?.unregister();
           if (navigator.serviceWorker.controller) {
@@ -131,8 +146,6 @@
         }
       }
 
-      const searchParameters = new URLSearchParams(location.search);
-      const parameters = Object.fromEntries(searchParameters);
       const publicationMappings = searchParameters.getAll("publish").map((mapping) => {
         const match = mapping.match(/^(0|[1-9][0-9]{0,4}):([1-9][0-9]{0,4})$/);
         if (!match) throw new Error(`invalid TCP publication mapping: ${mapping}`);
@@ -169,11 +182,13 @@
       }
 
       let opfs;
-      try {
-        opfs = await navigator.storage.getDirectory();
-      } catch (error) {
-        console.warn("Persistent storage is unavailable; continuing in live-only mode", error);
-        bootMode = "live";
+      if (!embedded) {
+        try {
+          opfs = await navigator.storage.getDirectory();
+        } catch (error) {
+          console.warn("Persistent storage is unavailable; continuing in live-only mode", error);
+          bootMode = "live";
+        }
       }
 
       const { cmdline = "" } = parameters;
@@ -329,25 +344,25 @@
         relayNetwork ?? hostFetchNetwork({ fetch: (request) => fetch(request) }),
       );
 
-      const disk =
-        bootMode === "live"
-          ? await openLiveDisk()
-          : await openInstallDisk({ directory: opfs, requireFilesystem: true });
+      const liveRoot = embedded || bootMode === "live";
+      const disk = liveRoot
+        ? await openLiveDisk()
+        : await openInstallDisk({ directory: opfs, requireFilesystem: true });
       // A ?live=1 recovery boot alongside an existing installation must not
       // expose two LOWLAND_ROOT disks to the general-purpose agent. Only an
       // unformatted device is attached to a live installer.
       const installDisk =
-        bootMode === "live" && persistentInstallSupported && opfs
+        !embedded && bootMode === "live" && persistentInstallSupported && opfs
           ? await openInstallDisk({ directory: opfs, requireFilesystem: false })
           : undefined;
       const bootDirectory = opfs
         ? await opfs.getDirectoryHandle("boot", { create: true })
         : undefined;
-      const guest = guestAgent();
+      const guest = guestAgent(embedded ? { readyTimeoutMs: 120_000 } : undefined);
       const networkAttachment = network.attach(guest);
 
       const args = [];
-      if (bootMode === "live") args.push("lowland.root.overlay=tmpfs");
+      if (liveRoot) args.push("lowland.root.overlay=tmpfs");
       if (installDisk) args.push("lowland.install=1");
       const extraArgs = cmdline.replace(/\+/g, " ");
       if (extraArgs) args.push(extraArgs);
@@ -358,15 +373,18 @@
       if (bootDirectory) {
         plugins.push(fileSystemDevice(new BrowserFS(bootDirectory), { tag: "boot", cache: false }));
       }
-      plugins.push(bootMode === "live" ? blockDevice(disk) : disk);
+      plugins.push(liveRoot ? blockDevice(disk) : disk);
       plugins.push(networkAttachment);
 
       const machine = await bootMachine({
-        cpus: navigator.hardwareConcurrency,
+        cpus: embedded ? 1 : navigator.hardwareConcurrency,
         args,
         plugins,
+        maximumMemoryPages: embedded ? 8192 : undefined,
+        maximumUserMemoryPages: embedded ? 4096 : undefined,
       });
       void machine.bootConsole.pipeTo(bootOut).catch(() => {});
+      emitHostEvent("boot-status", { status: "guest-started" });
       const publications = [];
       try {
         for (const mapping of publicationMappings) {
@@ -375,7 +393,19 @@
           term.write(
             `\r\nPublished relay TCP port ${publication.relayPort} to guest port ${publication.guestPort}\r\n`,
           );
-          void publication.closed.catch(reportError);
+          const detail = {
+            requestedHostPort: mapping.relayPort,
+            hostPort: publication.relayPort,
+            guestPort: publication.guestPort,
+          };
+          emitHostEvent("publication-opened", detail);
+          void publication.closed.then(
+            () => emitHostEvent("publication-closed", detail),
+            (error) => {
+              emitHostEvent("publication-closed", { ...detail, error: `${error}` });
+              reportError(error);
+            },
+          );
         }
       } catch (error) {
         for (const publication of publications) publication.close();
@@ -392,7 +422,6 @@
         await guest.fs.mkdir("/boot", { recursive: true });
         await guest.mount("boot", "/boot", { type: "virtiofs" });
       }
-
       // Service-worker and BroadcastChannel state is partitioned by site, so
       // only production low.land can provide its sibling guest-origin family.
       if (location.origin === "https://low.land") {
@@ -401,6 +430,7 @@
           fetch: (port) => guestFetchHandler(networkAttachment, { port }),
         });
       }
+      emitHostEvent("boot-status", { status: "ready" });
     </script>
   </body>
 </html>

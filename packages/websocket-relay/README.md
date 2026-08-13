@@ -60,8 +60,19 @@ when the demo ends.
 
 The implementation has no third-party dependencies. It uses C11 plus the
 POSIX/BSD socket and pthread APIs available on Linux and Apple platforms. The
-Apple `SO_NOSIGPIPE` path is included, so the networking core can be compiled
-into a future iOS application target; an iOS host application will still need
-to own lifecycle, background-execution, and TLS policy.
+Apple `SO_NOSIGPIPE` path is included.
+
+The build also produces `liblowland-websocket-relay.a` and the public
+`relay.h`. `lowland_relay_create()` binds the WebSocket listener and copies an
+instance-specific origin/publication policy, `lowland_relay_bound_port()`
+reports an ephemeral port, and `lowland_relay_run()` serves on its calling
+thread. `lowland_relay_stop()` is thread-safe and synchronous: it wakes the run
+loop, shuts down publications and active flows, and waits for every worker to
+drain. The same instance cannot be run again after stop; destroy it and create
+a fresh instance when applying new configuration.
+
+Run the direct library lifecycle test with `make test`. It covers origin
+enforcement, ephemeral WebSocket and publication listeners, a live inbound
+flow, synchronous shutdown, recreation, and descriptor cleanup.
 
 The protocol is documented in [PROTOCOL.md](./PROTOCOL.md).

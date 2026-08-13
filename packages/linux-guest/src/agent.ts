@@ -35,7 +35,11 @@ async function agent_device() {
   });
 }
 
-async function wait_for_guest(client: GuestClientCapabilities, machine: Machine) {
+async function wait_for_guest(
+  client: GuestClientCapabilities,
+  machine: Machine,
+  timeoutMs: number,
+) {
   let machine_ended = false;
   const ended = machine.closed.then(
     () => {
@@ -48,7 +52,7 @@ async function wait_for_guest(client: GuestClientCapabilities, machine: Machine)
     },
   );
 
-  const deadline = performance.now() + 30_000;
+  const deadline = performance.now() + timeoutMs;
   let failure: unknown;
   do {
     try {
@@ -89,6 +93,11 @@ export interface GuestAgent extends MachinePluginProvider {
   readonly unmount: Unmount;
 }
 
+export interface GuestAgentOptions {
+  /** How long to wait for the guest agent after boot. Defaults to 30 seconds. */
+  readyTimeoutMs?: number;
+}
+
 const readiness = new WeakMap<GuestAgent, (machine: Machine) => Promise<void>>();
 const machines_with_agent = new WeakSet<MachineSetup>();
 
@@ -105,7 +114,10 @@ export function wait_for_agent(agent: GuestAgent, machine: Machine): Promise<voi
  * partition label makes discovery independent of virtio device ordering. The
  * plugin does not finish booting until the agent is ready to accept requests.
  */
-export function guestAgent(): GuestAgent {
+export function guestAgent({ readyTimeoutMs = 30_000 }: GuestAgentOptions = {}): GuestAgent {
+  if (!Number.isFinite(readyTimeoutMs) || readyTimeoutMs <= 0) {
+    throw new RangeError("readyTimeoutMs must be a positive finite number");
+  }
   const vsock = vsockDevice();
   const client = create_guest_client(vsock);
   let configured = false;
@@ -119,7 +131,7 @@ export function guestAgent(): GuestAgent {
       return Promise.reject(new Error("guest agent is attached to a different machine"));
     }
     attached_machine = machine;
-    return (ready ??= wait_for_guest(client, machine));
+    return (ready ??= wait_for_guest(client, machine, readyTimeoutMs));
   };
 
   const plugin: MachinePlugin = {

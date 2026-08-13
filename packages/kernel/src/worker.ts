@@ -23,6 +23,7 @@ export interface InitMessage {
   vmlinux: WebAssembly.Module;
   memory: WebAssembly.Memory;
   user: UserContext | null;
+  maximum_user_memory_pages: number;
   /** One-shot user-memory copy result: 0 pending, 1 complete, negative errno. */
   user_copy_status: Int32Array<SharedArrayBuffer> | null;
 }
@@ -54,10 +55,12 @@ function user_imports({
   kernel_memory,
   get_kernel_instance,
   parent_user: parent,
+  maximum_user_memory_pages,
 }: {
   kernel_memory: WebAssembly.Memory;
   get_kernel_instance: () => Instance;
   parent_user: UserContext | null;
+  maximum_user_memory_pages: number;
 }): {
   context: UserContext | null;
   prepare(): void;
@@ -226,7 +229,11 @@ function user_imports({
           }
 
           minimum = Number(memory_import.type.minimum);
-          maximum = Math.min(Number(memory_import.type.maximum), rlimit_pages);
+          maximum = Math.min(
+            Number(memory_import.type.maximum),
+            rlimit_pages,
+            maximum_user_memory_pages,
+          );
         } catch {
           return -8; // exec format error
         }
@@ -390,6 +397,7 @@ function start({
   vmlinux,
   memory,
   user: initial_user_context,
+  maximum_user_memory_pages,
   user_copy_status,
 }: InitMessage) {
   // Refresh every WebAssembly.Memory received across a worker boundary
@@ -433,6 +441,7 @@ function start({
     kernel_memory: memory,
     get_kernel_instance: () => instance,
     parent_user: user_context,
+    maximum_user_memory_pages,
   });
 
   const imports = {
@@ -463,6 +472,7 @@ function start({
           vmlinux,
           memory,
           user,
+          maximum_user_memory_pages,
           user_copy_status,
         } satisfies InitMessage);
         if (!user_copy_status) return 0;

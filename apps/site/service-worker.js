@@ -36,10 +36,14 @@ async function bootFile(pathname) {
 }
 
 async function liveRequest(event, url) {
-  if (url.searchParams.get("live") === "1") return true;
+  if (url.searchParams.get("live") === "1" || url.searchParams.get("embed") === "1") {
+    return true;
+  }
   if (!event.clientId) return false;
   const client = await self.clients.get(event.clientId);
-  return client !== undefined && new URL(client.url).searchParams.get("live") === "1";
+  if (client === undefined) return false;
+  const parameters = new URL(client.url).searchParams;
+  return parameters.get("live") === "1" || parameters.get("embed") === "1";
 }
 
 async function serve(event) {

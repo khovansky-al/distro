@@ -100,3 +100,55 @@ test("falls back to live-only mode when persistent storage is unavailable", asyn
   await expect(terminal).toContainText("live-only-ready");
   expect(dialogs).toEqual([]);
 });
+
+test("embedded mode boots ephemerally without service-worker or persistent storage", async ({
+  page,
+}) => {
+  test.setTimeout(120_000);
+  await page.addInitScript(() => {
+    window.lowlandEvents = [];
+    for (const type of ["boot-status", "publication-opened", "publication-closed", "fatal"]) {
+      addEventListener(`lowland:${type}`, (event) =>
+        window.lowlandEvents.push({ type, detail: event.detail }),
+      );
+    }
+    if (navigator.serviceWorker) {
+      Object.defineProperty(navigator.serviceWorker, "register", {
+        value: () => {
+          throw new Error("embedded mode registered a service worker");
+        },
+      });
+    }
+    Object.defineProperty(navigator.storage, "getDirectory", {
+      value: () => {
+        throw new Error("embedded mode opened persistent storage");
+      },
+    });
+  });
+
+  await page.goto("/?embed=1&webgl=0");
+  const terminal = page.locator(".xterm-rows");
+  await expect(terminal).toContainText("root@lowland", { timeout: 30_000 });
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.lowlandEvents.some(
+          (event) => event.type === "boot-status" && event.detail.status === "ready",
+        ),
+      ),
+    )
+    .toBe(true);
+  expect(
+    await page.evaluate(() => crossOriginIsolated && typeof SharedArrayBuffer === "function"),
+  ).toBe(true);
+  expect(
+    await page.evaluate(() => window.lowlandEvents.some((event) => event.type === "fatal")),
+  ).toBe(false);
+
+  const input = page.locator(".xterm-helper-textarea");
+  await input.pressSequentially(
+    "mount | grep ' on / type overlay' >/dev/null && ! grep -q ' /boot virtiofs ' /proc/mounts && test ! -b /dev/vdb && printf 'embedded-%s\\n' ephemeral",
+  );
+  await input.press("Enter");
+  await expect(terminal).toContainText("embedded-ephemeral");
+});

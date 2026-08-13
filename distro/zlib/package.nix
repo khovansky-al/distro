@@ -20,7 +20,12 @@ stdenv.mkDerivation (finalAttrs: {
 
   # Static-only target: no shared library, no PIC shims.
   dontDisableStatic = true;
-  configureFlags = [ "--static" ];
+  configureFlags = [
+    "--static"
+    # Configure otherwise identifies the Darwin build host and replaces the
+    # WASM archiver with Apple's Mach-O-only /usr/bin/libtool.
+    "--uname=linux"
+  ];
 
   passthru.checks =
     let

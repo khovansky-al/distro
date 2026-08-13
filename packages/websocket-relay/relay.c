@@ -2,6 +2,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "relay.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -47,9 +49,8 @@ enum opcode {
 	OP_ERROR = 0xff,
 };
 
-static const char *required_origin;
-
 struct publication;
+struct relay_client;
 
 struct publish_policy {
 	char *address;
@@ -73,6 +74,7 @@ struct active_flow {
 };
 
 struct publication {
+	struct lowland_relay *relay;
 	struct publish_policy *policy;
 	int listener;
 	int websocket;
@@ -83,8 +85,27 @@ struct publication {
 	struct active_flow *flows;
 };
 
-static pthread_mutex_t publications_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct publish_policy *publish_policies;
+struct relay_client {
+	struct lowland_relay *relay;
+	int socket;
+	int auxiliary_socket;
+	struct relay_client *next;
+};
+
+struct lowland_relay {
+	char *required_origin;
+	struct publish_policy *publish_policies;
+	pthread_mutex_t mutex;
+	pthread_cond_t drained;
+	struct relay_client *clients;
+	int listener;
+	int wake_read;
+	int wake_write;
+	uint16_t bound_port;
+	unsigned int worker_count;
+	bool running;
+	bool stopping;
+};
 
 static int listen_socket(const char *host, const char *service);
 static int bound_service(int fd, char service[SERVICE_LENGTH]);
@@ -325,7 +346,7 @@ static bool has_token(const char *list, const char *wanted)
 	return false;
 }
 
-static int websocket_handshake(int fd)
+static int websocket_handshake(const struct lowland_relay *relay, int fd)
 {
 	char request[HTTP_LIMIT + 1], key[256], upgrade[64], connection[256];
 	char version[16], protocols[256], origin[1024], combined[512], accept[32];
@@ -355,9 +376,9 @@ static int websocket_handshake(int fd)
 	    header_value(request, "Sec-WebSocket-Protocol", protocols, sizeof(protocols)) < 0 ||
 	    !has_token(protocols, SUBPROTOCOL))
 		return -1;
-	if (required_origin &&
+	if (relay->required_origin &&
 	    (header_value(request, "Origin", origin, sizeof(origin)) < 0 ||
-	     strcmp(origin, required_origin) != 0))
+	     strcmp(origin, relay->required_origin) != 0))
 		return -1;
 	if (snprintf(combined, sizeof(combined), "%s%s", key, WEBSOCKET_GUID) >=
 	    (int)sizeof(combined))
@@ -466,7 +487,13 @@ static int websocket_read(int fd, unsigned char **result, size_t *result_length)
 			free(payload);
 			goto failure;
 		}
-		for (index = 0; index < length; index++)
+		for (index = 0; index + 4 <= length; index += 4) {
+			payload[index] ^= mask[0];
+			payload[index + 1] ^= mask[1];
+			payload[index + 2] ^= mask[2];
+			payload[index + 3] ^= mask[3];
+		}
+		for (; index < length; index++)
 			payload[index] ^= mask[index & 3];
 		if (opcode == 0x8) {
 			free(payload);
@@ -580,7 +607,19 @@ static int resolve_request(int fd, const unsigned char *message, size_t length)
 			 websocket_send(fd, 0x2, response, used);
 }
 
-static int connect_socket(const char *host, unsigned int port)
+static void set_auxiliary_socket(struct relay_client *client, int socket)
+{
+	struct lowland_relay *relay = client->relay;
+
+	pthread_mutex_lock(&relay->mutex);
+	client->auxiliary_socket = socket;
+	if (socket >= 0 && relay->stopping)
+		shutdown(socket, SHUT_RDWR);
+	pthread_mutex_unlock(&relay->mutex);
+}
+
+static int connect_socket(struct relay_client *client, const char *host,
+			  unsigned int port)
 {
 	struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
 	struct addrinfo *addresses = NULL, *current;
@@ -594,6 +633,7 @@ static int connect_socket(const char *host, unsigned int port)
 		fd = socket(current->ai_family, current->ai_socktype, current->ai_protocol);
 		if (fd < 0)
 			continue;
+		set_auxiliary_socket(client, fd);
 #ifdef SO_NOSIGPIPE
 		{
 			int enabled = 1;
@@ -602,6 +642,7 @@ static int connect_socket(const char *host, unsigned int port)
 #endif
 		if (connect(fd, current->ai_addr, current->ai_addrlen) == 0)
 			break;
+		set_auxiliary_socket(client, -1);
 		close(fd);
 		fd = -1;
 	}
@@ -680,8 +721,10 @@ failure:
 	return -1;
 }
 
-static int relay_tcp(int websocket, const unsigned char *request, size_t length)
+static int relay_tcp(struct relay_client *client, const unsigned char *request,
+		     size_t length)
 {
+	int websocket = client->socket;
 	unsigned int port;
 	char *host;
 	int upstream;
@@ -689,13 +732,14 @@ static int relay_tcp(int websocket, const unsigned char *request, size_t length)
 	if (length < 4 || (port = (unsigned int)request[1] << 8 | request[2]) == 0 ||
 	    !(host = message_host(request, 3, length)))
 		return protocol_error(websocket, "invalid CONNECT request");
-	upstream = connect_socket(host, port);
+	upstream = connect_socket(client, host, port);
 	free(host);
 	if (upstream < 0)
 		return protocol_error(websocket, "upstream TCP connection failed");
 	{
 		int status = relay_socket(websocket, upstream, OP_CONNECTED);
 
+		set_auxiliary_socket(client, -1);
 		close(upstream);
 		return status;
 	}
@@ -733,11 +777,13 @@ static int64_t monotonic_milliseconds(void)
 	return (int64_t)time(NULL) * 1000;
 }
 
-static bool capability_exists_locked(const unsigned char capability[CAPABILITY_LENGTH])
+static bool capability_exists_locked(
+	const struct lowland_relay *relay,
+	const unsigned char capability[CAPABILITY_LENGTH])
 {
 	struct publish_policy *policy;
 
-	for (policy = publish_policies; policy; policy = policy->next) {
+	for (policy = relay->publish_policies; policy; policy = policy->next) {
 		struct pending_connection *pending;
 
 		if (!policy->active)
@@ -759,12 +805,13 @@ static void release_publication_locked(struct publication *publication)
 
 static void close_publication(struct publication *publication)
 {
+	struct lowland_relay *relay = publication->relay;
 	struct pending_connection *pending;
 	struct active_flow *flow;
 
-	pthread_mutex_lock(&publications_mutex);
+	pthread_mutex_lock(&relay->mutex);
 	if (publication->closed) {
-		pthread_mutex_unlock(&publications_mutex);
+		pthread_mutex_unlock(&relay->mutex);
 		return;
 	}
 	publication->closed = true;
@@ -789,32 +836,34 @@ static void close_publication(struct publication *publication)
 		shutdown(flow->websocket, SHUT_RDWR);
 	}
 	release_publication_locked(publication);
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 }
 
 static void remove_active_flow(struct publication *publication,
 			       struct active_flow *flow)
 {
+	struct lowland_relay *relay = publication->relay;
 	struct active_flow **link;
 
-	pthread_mutex_lock(&publications_mutex);
+	pthread_mutex_lock(&relay->mutex);
 	for (link = &publication->flows; *link && *link != flow; link = &(*link)->next)
 		;
 	if (*link == flow) {
 		*link = flow->next;
 		release_publication_locked(publication);
 	}
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 }
 
 static struct publication *claim_pending(
+	struct lowland_relay *relay,
 	const unsigned char capability[CAPABILITY_LENGTH], struct active_flow *flow)
 {
 	struct publish_policy *policy;
 	int64_t now = monotonic_milliseconds();
 
-	pthread_mutex_lock(&publications_mutex);
-	for (policy = publish_policies; policy; policy = policy->next) {
+	pthread_mutex_lock(&relay->mutex);
+	for (policy = relay->publish_policies; policy; policy = policy->next) {
 		struct publication *publication = policy->active;
 		struct pending_connection **link;
 
@@ -822,7 +871,6 @@ static struct publication *claim_pending(
 			continue;
 		for (link = &publication->pending; *link; link = &(*link)->next) {
 			struct pending_connection *pending = *link;
-
 			if (memcmp(pending->capability, capability,
 				   CAPABILITY_LENGTH) != 0)
 				continue;
@@ -831,7 +879,7 @@ static struct publication *claim_pending(
 			if (pending->expires_at <= now) {
 				close(pending->socket);
 				free(pending);
-				pthread_mutex_unlock(&publications_mutex);
+				pthread_mutex_unlock(&relay->mutex);
 				return NULL;
 			}
 			flow->socket = pending->socket;
@@ -839,20 +887,21 @@ static struct publication *claim_pending(
 			publication->flows = flow;
 			publication->references++;
 			free(pending);
-			pthread_mutex_unlock(&publications_mutex);
+			pthread_mutex_unlock(&relay->mutex);
 			return publication;
 		}
 	}
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 	return NULL;
 }
 
 static bool reject_pending(struct publication *publication,
 			   const unsigned char capability[CAPABILITY_LENGTH])
 {
+	struct lowland_relay *relay = publication->relay;
 	struct pending_connection **link;
 
-	pthread_mutex_lock(&publications_mutex);
+	pthread_mutex_lock(&relay->mutex);
 	for (link = &publication->pending; *link; link = &(*link)->next) {
 		struct pending_connection *pending = *link;
 
@@ -862,19 +911,20 @@ static bool reject_pending(struct publication *publication,
 		publication->pending_count--;
 		close(pending->socket);
 		free(pending);
-		pthread_mutex_unlock(&publications_mutex);
+		pthread_mutex_unlock(&relay->mutex);
 		return true;
 	}
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 	return false;
 }
 
 static void expire_pending(struct publication *publication)
 {
+	struct lowland_relay *relay = publication->relay;
 	struct pending_connection **link;
 	int64_t now = monotonic_milliseconds();
 
-	pthread_mutex_lock(&publications_mutex);
+	pthread_mutex_lock(&relay->mutex);
 	for (link = &publication->pending; *link;) {
 		struct pending_connection *pending = *link;
 
@@ -887,7 +937,7 @@ static void expire_pending(struct publication *publication)
 		close(pending->socket);
 		free(pending);
 	}
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 }
 
 static int queue_incoming(struct publication *publication)
@@ -917,11 +967,11 @@ static int queue_incoming(struct publication *publication)
 		free(pending);
 		return 0;
 	}
-	pthread_mutex_lock(&publications_mutex);
+	pthread_mutex_lock(&publication->relay->mutex);
 	if (publication->closed ||
 	    publication->pending_count >= MAX_PENDING_CONNECTIONS ||
-	    capability_exists_locked(pending->capability)) {
-		pthread_mutex_unlock(&publications_mutex);
+	    capability_exists_locked(publication->relay, pending->capability)) {
+		pthread_mutex_unlock(&publication->relay->mutex);
 		close(incoming);
 		free(pending);
 		return 0;
@@ -931,11 +981,12 @@ static int queue_incoming(struct publication *publication)
 	publication->pending_count++;
 	message[0] = OP_INCOMING;
 	memcpy(message + 1, pending->capability, CAPABILITY_LENGTH);
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&publication->relay->mutex);
 	return websocket_send(publication->websocket, 0x2, message, sizeof(message));
 }
 
-static int relay_accepted(int websocket, const unsigned char *request, size_t length)
+static int relay_accepted(struct lowland_relay *relay, int websocket,
+			  const unsigned char *request, size_t length)
 {
 	struct active_flow flow = { .websocket = websocket };
 	struct publication *publication;
@@ -943,7 +994,7 @@ static int relay_accepted(int websocket, const unsigned char *request, size_t le
 
 	if (length != 1 + CAPABILITY_LENGTH)
 		return protocol_error(websocket, "invalid ACCEPT request");
-	publication = claim_pending(request + 1, &flow);
+	publication = claim_pending(relay, request + 1, &flow);
 	if (!publication)
 		return protocol_error(websocket, "pending connection is unavailable");
 	status = relay_socket(websocket, flow.socket, OP_ACCEPTED);
@@ -952,7 +1003,8 @@ static int relay_accepted(int websocket, const unsigned char *request, size_t le
 	return status;
 }
 
-static int relay_bind(int websocket, const unsigned char *request, size_t length)
+static int relay_bind(struct lowland_relay *relay, int websocket,
+		      const unsigned char *request, size_t length)
 {
 	struct publication *publication;
 	struct publish_policy *policy;
@@ -970,16 +1022,17 @@ static int relay_bind(int websocket, const unsigned char *request, size_t length
 	publication = calloc(1, sizeof(*publication));
 	if (!publication)
 		return protocol_error(websocket, "relay is out of memory");
+	publication->relay = relay;
 	publication->listener = -1;
 	publication->websocket = websocket;
 	publication->references = 1;
-	pthread_mutex_lock(&publications_mutex);
-	for (policy = publish_policies; policy; policy = policy->next) {
+	pthread_mutex_lock(&relay->mutex);
+	for (policy = relay->publish_policies; policy; policy = policy->next) {
 		if (policy->relay_port == relay_port && policy->guest_port == guest_port)
 			break;
 	}
 	if (!policy || policy->active) {
-		pthread_mutex_unlock(&publications_mutex);
+		pthread_mutex_unlock(&relay->mutex);
 		free(publication);
 		return protocol_error(websocket,
 			policy ? "publication is already active" :
@@ -987,7 +1040,7 @@ static int relay_bind(int websocket, const unsigned char *request, size_t length
 	}
 	publication->policy = policy;
 	policy->active = publication;
-	pthread_mutex_unlock(&publications_mutex);
+	pthread_mutex_unlock(&relay->mutex);
 
 	snprintf(service, sizeof(service), "%u", relay_port);
 	publication->listener = listen_socket(policy->address, service);
@@ -1060,9 +1113,26 @@ static int relay_bind(int websocket, const unsigned char *request, size_t length
 	return status;
 }
 
+static void remove_client(struct relay_client *client)
+{
+	struct lowland_relay *relay = client->relay;
+	struct relay_client **link;
+
+	pthread_mutex_lock(&relay->mutex);
+	for (link = &relay->clients; *link && *link != client; link = &(*link)->next)
+		;
+	if (*link == client)
+		*link = client->next;
+	relay->worker_count--;
+	pthread_cond_broadcast(&relay->drained);
+	pthread_mutex_unlock(&relay->mutex);
+}
+
 static void *serve_client(void *argument)
 {
-	int fd = (int)(intptr_t)argument;
+	struct relay_client *client = argument;
+	struct lowland_relay *relay = client->relay;
+	int fd = client->socket;
 	unsigned char *message = NULL;
 	size_t length = 0;
 
@@ -1072,17 +1142,18 @@ static void *serve_client(void *argument)
 		setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 	}
 #endif
-	if (websocket_handshake(fd) < 0 || websocket_read(fd, &message, &length) <= 0 ||
+	if (websocket_handshake(relay, fd) < 0 ||
+	    websocket_read(fd, &message, &length) <= 0 ||
 	    length == 0)
 		goto done;
 	if (message[0] == OP_RESOLVE)
 		resolve_request(fd, message, length);
 	else if (message[0] == OP_CONNECT)
-		relay_tcp(fd, message, length);
+		relay_tcp(client, message, length);
 	else if (message[0] == OP_BIND)
-		relay_bind(fd, message, length);
+		relay_bind(relay, fd, message, length);
 	else if (message[0] == OP_ACCEPT)
-		relay_accepted(fd, message, length);
+		relay_accepted(relay, fd, message, length);
 	else
 		protocol_error(fd, "unsupported initial opcode");
 
@@ -1090,6 +1161,8 @@ done:
 	free(message);
 	websocket_send(fd, 0x8, NULL, 0);
 	close(fd);
+	remove_client(client);
+	free(client);
 	return NULL;
 }
 
@@ -1119,107 +1192,6 @@ static int listen_socket(const char *host, const char *service)
 	return fd;
 }
 
-static char *copy_range(const char *start, size_t length)
-{
-	char *copy = malloc(length + 1);
-
-	if (!copy)
-		return NULL;
-	memcpy(copy, start, length);
-	copy[length] = '\0';
-	return copy;
-}
-
-static int parse_port_range(const char *start, size_t length, bool allow_zero,
-			    unsigned int *result)
-{
-	unsigned long value = 0;
-	size_t index;
-
-	if (length == 0)
-		return -1;
-	for (index = 0; index < length; index++) {
-		if (start[index] < '0' || start[index] > '9')
-			return -1;
-		value = value * 10 + (unsigned int)(start[index] - '0');
-		if (value > 65535)
-			return -1;
-	}
-	if (!allow_zero && value == 0)
-		return -1;
-	*result = (unsigned int)value;
-	return 0;
-}
-
-static int add_publish_policy(const char *mapping)
-{
-	const char *address_start = "127.0.0.1", *relay_start, *guest_start;
-	const char *first, *second;
-	size_t address_length = strlen(address_start), relay_length;
-	struct publish_policy *policy, *current;
-
-	if (mapping[0] == '[') {
-		const char *closing = strchr(mapping + 1, ']');
-
-		if (!closing || closing == mapping + 1 || closing[1] != ':')
-			return -1;
-		address_start = mapping + 1;
-		address_length = (size_t)(closing - address_start);
-		relay_start = closing + 2;
-	} else {
-		first = strchr(mapping, ':');
-		if (!first)
-			return -1;
-		second = strchr(first + 1, ':');
-		if (second) {
-			if (first == mapping || strchr(second + 1, ':'))
-				return -1;
-			address_start = mapping;
-			address_length = (size_t)(first - mapping);
-			relay_start = first + 1;
-		} else {
-			relay_start = mapping;
-		}
-	}
-	first = strchr(relay_start, ':');
-	if (!first || strchr(first + 1, ':'))
-		return -1;
-	relay_length = (size_t)(first - relay_start);
-	guest_start = first + 1;
-	policy = calloc(1, sizeof(*policy));
-	if (!policy)
-		return -1;
-	policy->address = copy_range(address_start, address_length);
-	if (!policy->address ||
-	    parse_port_range(relay_start, relay_length, true, &policy->relay_port) < 0 ||
-	    parse_port_range(guest_start, strlen(guest_start), false,
-			     &policy->guest_port) < 0) {
-		free(policy->address);
-		free(policy);
-		return -1;
-	}
-	for (current = publish_policies; current; current = current->next) {
-		/* BIND selects by port pair; requiring uniqueness keeps address policy exact. */
-		if (current->relay_port == policy->relay_port &&
-		    current->guest_port == policy->guest_port) {
-			free(policy->address);
-			free(policy);
-			return -1;
-		}
-	}
-	policy->next = publish_policies;
-	publish_policies = policy;
-	return 0;
-}
-
-static void usage(const char *program)
-{
-	fprintf(stderr,
-		"usage: %s [--listen ADDRESS] [--port PORT] [--origin URL] "
-		"[--publish [ADDRESS:]RELAY_PORT:GUEST_PORT]...\n",
-		program);
-}
-
 static int bound_service(int fd, char service[SERVICE_LENGTH])
 {
 	struct sockaddr_storage address;
@@ -1230,68 +1202,276 @@ static int bound_service(int fd, char service[SERVICE_LENGTH])
 				   SERVICE_LENGTH, NI_NUMERICSERV);
 }
 
-int main(int argc, char **argv)
+static void set_error(char *error, size_t capacity, const char *message)
 {
-	const char *host = "127.0.0.1", *port = "8080";
+	if (error && capacity)
+		snprintf(error, capacity, "%s", message);
+}
+
+static void free_policies(struct publish_policy *policy)
+{
+	while (policy) {
+		struct publish_policy *next = policy->next;
+
+		free(policy->address);
+		free(policy);
+		policy = next;
+	}
+}
+
+static int add_publish_policy(struct lowland_relay *relay,
+			      const struct lowland_relay_publication *mapping)
+{
+	struct publish_policy *policy, *current;
+	const char *address = mapping->listen_address ? mapping->listen_address :
+						       "127.0.0.1";
+
+	if (!address[0] || mapping->guest_port == 0)
+		return -1;
+	for (current = relay->publish_policies; current; current = current->next) {
+		if (current->relay_port == mapping->host_port &&
+		    current->guest_port == mapping->guest_port)
+			return -1;
+	}
+	policy = calloc(1, sizeof(*policy));
+	if (!policy)
+		return -1;
+	policy->address = strdup(address);
+	if (!policy->address) {
+		free(policy);
+		return -1;
+	}
+	policy->relay_port = mapping->host_port;
+	policy->guest_port = mapping->guest_port;
+	policy->next = relay->publish_policies;
+	relay->publish_policies = policy;
+	return 0;
+}
+
+struct lowland_relay *lowland_relay_create(const struct lowland_relay_config *config,
+					   char *error, size_t error_capacity)
+{
+	struct lowland_relay *relay;
+	const char *address;
 	char service[SERVICE_LENGTH];
-	int listener, index;
+	int wake_fds[2] = { -1, -1 };
+	size_t index;
 
-	for (index = 1; index < argc; index++) {
-		if (index + 1 == argc) {
-			usage(argv[0]);
-			return 2;
-		}
-		if (strcmp(argv[index], "--listen") == 0)
-			host = argv[++index];
-		else if (strcmp(argv[index], "--port") == 0)
-			port = argv[++index];
-		else if (strcmp(argv[index], "--origin") == 0)
-			required_origin = argv[++index];
-		else if (strcmp(argv[index], "--publish") == 0) {
-			if (add_publish_policy(argv[++index]) < 0) {
-				fprintf(stderr, "invalid --publish mapping: %s\n", argv[index]);
-				return 2;
-			}
-		}
-		else {
-			usage(argv[0]);
-			return 2;
+	if (!config || (config->publication_count && !config->publications)) {
+		set_error(error, error_capacity, "invalid relay configuration");
+		return NULL;
+	}
+	address = config->listen_address ? config->listen_address : "127.0.0.1";
+	if (!address[0]) {
+		set_error(error, error_capacity, "invalid relay listen address");
+		return NULL;
+	}
+	relay = calloc(1, sizeof(*relay));
+	if (!relay) {
+		set_error(error, error_capacity, "relay is out of memory");
+		return NULL;
+	}
+	relay->listener = -1;
+	relay->wake_read = -1;
+	relay->wake_write = -1;
+	if (pthread_mutex_init(&relay->mutex, NULL) != 0) {
+		set_error(error, error_capacity, "could not initialize relay mutex");
+		free(relay);
+		return NULL;
+	}
+	if (pthread_cond_init(&relay->drained, NULL) != 0) {
+		set_error(error, error_capacity, "could not initialize relay condition");
+		pthread_mutex_destroy(&relay->mutex);
+		free(relay);
+		return NULL;
+	}
+	if (config->required_origin) {
+		relay->required_origin = strdup(config->required_origin);
+		if (!relay->required_origin)
+			goto memory_failure;
+	}
+	for (index = 0; index < config->publication_count; index++) {
+		if (add_publish_policy(relay, &config->publications[index]) < 0) {
+			set_error(error, error_capacity,
+				  "invalid or duplicate publication policy");
+			goto failure;
 		}
 	}
-#ifdef SIGPIPE
-	signal(SIGPIPE, SIG_IGN);
-#endif
-	listener = listen_socket(host, port);
-	if (listener < 0) {
-		perror("listen");
-		return 1;
+	if (pipe(wake_fds) < 0) {
+		set_error(error, error_capacity, "could not create relay wake pipe");
+		goto failure;
 	}
-	if (bound_service(listener, service) != 0) {
-		perror("getsockname");
-		close(listener);
-		return 1;
+	relay->wake_read = wake_fds[0];
+	relay->wake_write = wake_fds[1];
+	snprintf(service, sizeof(service), "%u", config->listen_port);
+	relay->listener = listen_socket(address, service);
+	if (relay->listener < 0 || bound_service(relay->listener, service) != 0) {
+		set_error(error, error_capacity, "could not bind relay listener");
+		goto failure;
 	}
-	printf(strchr(host, ':') ? "Listening on ws://[%s]:%s/\n" :
-				  "Listening on ws://%s:%s/\n",
-	       host, service);
-	fflush(stdout);
+	relay->bound_port = (uint16_t)strtoul(service, NULL, 10);
+	if (relay->bound_port == 0) {
+		set_error(error, error_capacity, "relay returned an invalid listener port");
+		goto failure;
+	}
+	set_error(error, error_capacity, "");
+	return relay;
+
+memory_failure:
+	set_error(error, error_capacity, "relay is out of memory");
+failure:
+	if (relay->listener >= 0)
+		close(relay->listener);
+	if (relay->wake_read >= 0)
+		close(relay->wake_read);
+	if (relay->wake_write >= 0)
+		close(relay->wake_write);
+	free_policies(relay->publish_policies);
+	free(relay->required_origin);
+	pthread_cond_destroy(&relay->drained);
+	pthread_mutex_destroy(&relay->mutex);
+	free(relay);
+	return NULL;
+}
+
+uint16_t lowland_relay_bound_port(const struct lowland_relay *relay)
+{
+	return relay ? relay->bound_port : 0;
+}
+
+int lowland_relay_run(struct lowland_relay *relay)
+{
+	int result = 0;
+
+	if (!relay)
+		return -1;
+	pthread_mutex_lock(&relay->mutex);
+	if (relay->running || relay->stopping || relay->listener < 0) {
+		pthread_mutex_unlock(&relay->mutex);
+		return -1;
+	}
+	relay->running = true;
+	pthread_mutex_unlock(&relay->mutex);
 	for (;;) {
-		pthread_t thread;
-		int client = accept(listener, NULL, NULL);
+		fd_set readable;
+		int selected, maximum;
 
-		if (client < 0) {
+		FD_ZERO(&readable);
+		FD_SET(relay->listener, &readable);
+		FD_SET(relay->wake_read, &readable);
+		maximum = relay->listener > relay->wake_read ? relay->listener :
+								   relay->wake_read;
+		selected = select(maximum + 1, &readable, NULL, NULL, NULL);
+		if (selected < 0) {
 			if (errno == EINTR)
 				continue;
-			perror("accept");
+			result = -1;
 			break;
 		}
-		if (pthread_create(&thread, NULL, serve_client,
-				   (void *)(intptr_t)client) != 0) {
-			close(client);
-			continue;
+		if (FD_ISSET(relay->wake_read, &readable))
+			break;
+		if (FD_ISSET(relay->listener, &readable)) {
+			struct relay_client *client = calloc(1, sizeof(*client));
+			pthread_t thread;
+
+			if (!client)
+				continue;
+			client->relay = relay;
+			client->auxiliary_socket = -1;
+			client->socket = accept(relay->listener, NULL, NULL);
+			if (client->socket < 0) {
+				free(client);
+				if (errno == EINTR)
+					continue;
+				result = -1;
+				break;
+			}
+			pthread_mutex_lock(&relay->mutex);
+			if (relay->stopping) {
+				pthread_mutex_unlock(&relay->mutex);
+				close(client->socket);
+				free(client);
+				break;
+			}
+			client->next = relay->clients;
+			relay->clients = client;
+			relay->worker_count++;
+			pthread_mutex_unlock(&relay->mutex);
+			if (pthread_create(&thread, NULL, serve_client, client) != 0) {
+				close(client->socket);
+				remove_client(client);
+				free(client);
+				continue;
+			}
+			pthread_detach(thread);
 		}
-		pthread_detach(thread);
 	}
-	close(listener);
-	return 1;
+	pthread_mutex_lock(&relay->mutex);
+	if (relay->listener >= 0) {
+		close(relay->listener);
+		relay->listener = -1;
+	}
+	relay->running = false;
+	pthread_cond_broadcast(&relay->drained);
+	pthread_mutex_unlock(&relay->mutex);
+	return result;
+}
+
+void lowland_relay_stop(struct lowland_relay *relay)
+{
+	struct relay_client *client;
+	struct publish_policy *policy;
+
+	if (!relay)
+		return;
+	pthread_mutex_lock(&relay->mutex);
+	if (!relay->stopping) {
+		char wake = 1;
+
+		relay->stopping = true;
+		if (relay->running)
+			(void)write(relay->wake_write, &wake, sizeof(wake));
+		else if (relay->listener >= 0) {
+			close(relay->listener);
+			relay->listener = -1;
+		}
+		for (client = relay->clients; client; client = client->next) {
+			shutdown(client->socket, SHUT_RDWR);
+			if (client->auxiliary_socket >= 0)
+				shutdown(client->auxiliary_socket, SHUT_RDWR);
+		}
+		for (policy = relay->publish_policies; policy; policy = policy->next) {
+			struct publication *publication = policy->active;
+			struct pending_connection *pending;
+			struct active_flow *flow;
+
+			if (!publication)
+				continue;
+			if (publication->listener >= 0)
+				shutdown(publication->listener, SHUT_RDWR);
+			for (pending = publication->pending; pending; pending = pending->next)
+				shutdown(pending->socket, SHUT_RDWR);
+			for (flow = publication->flows; flow; flow = flow->next) {
+				shutdown(flow->socket, SHUT_RDWR);
+				shutdown(flow->websocket, SHUT_RDWR);
+			}
+		}
+	}
+	while (relay->running || relay->worker_count)
+		pthread_cond_wait(&relay->drained, &relay->mutex);
+	pthread_mutex_unlock(&relay->mutex);
+}
+
+void lowland_relay_destroy(struct lowland_relay *relay)
+{
+	if (!relay)
+		return;
+	lowland_relay_stop(relay);
+	close(relay->wake_read);
+	close(relay->wake_write);
+	free_policies(relay->publish_policies);
+	free(relay->required_origin);
+	pthread_cond_destroy(&relay->drained);
+	pthread_mutex_destroy(&relay->mutex);
+	free(relay);
 }

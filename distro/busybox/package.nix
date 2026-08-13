@@ -25,6 +25,11 @@ stdenv.mkDerivation (finalAttrs: {
   configurePhase = ''
     runHook preConfigure
 
+    # Kconfig builds fixdep before the package build phase. Use the native
+    # build compiler here as well as below; BusyBox otherwise assumes a
+    # command named gcc, which Darwin's clang stdenv does not provide.
+    export HOSTCC="$CC_FOR_BUILD"
+
     config() {
       sed -i "/CONFIG_$1=/d" .config
       sed -i "/CONFIG_$1 is not set/d" .config
@@ -34,7 +39,7 @@ stdenv.mkDerivation (finalAttrs: {
       esac
     }
 
-    make -j$NIX_BUILD_CORES defconfig
+    make -j$NIX_BUILD_CORES HOSTCC="$CC_FOR_BUILD" defconfig
     config STATIC y
     config NOMMU y
     config STATIC_LIBGCC n
@@ -100,7 +105,7 @@ stdenv.mkDerivation (finalAttrs: {
     config HWCLOCK n
     config RTCWAKE n
 
-    make -j$NIX_BUILD_CORES oldconfig
+    make -j$NIX_BUILD_CORES HOSTCC="$CC_FOR_BUILD" oldconfig
 
     runHook postConfigure
   '';

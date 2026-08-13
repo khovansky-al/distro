@@ -62,6 +62,10 @@ type MaybePromise<T> = T | PromiseLike<T>;
 export interface BootMachineOptions {
   /** Virtual CPUs to boot, one Web Worker each. */
   cpus: number;
+  /** Maximum shared kernel-memory pages. Defaults to the wasm32 limit. */
+  maximumMemoryPages?: number;
+  /** Maximum shared memory pages reserved by each userspace process. */
+  maximumUserMemoryPages?: number;
   /** Kernel command-line arguments, appended after `console=hvc0`. */
   args?: readonly string[];
   /** Plugins to configure in array order before the machine boots. */
@@ -136,6 +140,7 @@ const load_resources = () => (resources ??= read_resources());
 const PAGE_SIZE = 0x10000;
 // Leave the final wasm32 page out so the physical-memory size fits in u32.
 const KERNEL_MEMORY_MAXIMUM_PAGES = 0xffff;
+const WASM32_MEMORY_MAXIMUM_PAGES = 0x10000;
 
 function kernel_initial_pages(memory: WasmMemoryType, initcpio_size: number): number {
   const maximum = BigInt(KERNEL_MEMORY_MAXIMUM_PAGES);
@@ -233,9 +238,25 @@ export async function bootMachine(options: BootMachineOptions): Promise<Machine>
     const module_pages = Number(memory_type.minimum);
     const initcpio_addr = module_pages * PAGE_SIZE;
     const pages = kernel_initial_pages(memory_type, initcpio?.byteLength ?? 0);
+    const preferred_maximum_pages = options.maximumMemoryPages ?? KERNEL_MEMORY_MAXIMUM_PAGES;
+    if (
+      !Number.isInteger(preferred_maximum_pages) ||
+      preferred_maximum_pages < pages ||
+      preferred_maximum_pages > KERNEL_MEMORY_MAXIMUM_PAGES
+    ) {
+      throw new RangeError("maximumMemoryPages is outside the supported kernel memory range");
+    }
+    const maximum_user_memory_pages = options.maximumUserMemoryPages ?? WASM32_MEMORY_MAXIMUM_PAGES;
+    if (
+      !Number.isInteger(maximum_user_memory_pages) ||
+      maximum_user_memory_pages <= 0 ||
+      maximum_user_memory_pages > WASM32_MEMORY_MAXIMUM_PAGES
+    ) {
+      throw new RangeError("maximumUserMemoryPages is outside the wasm32 memory range");
+    }
     const { memory: wasm_memory, maximum_pages } = allocate_shared_memory(
       pages,
-      KERNEL_MEMORY_MAXIMUM_PAGES,
+      preferred_maximum_pages,
     );
     assert(wasm_memory.buffer.byteLength === pages * PAGE_SIZE);
 
@@ -368,6 +389,7 @@ export async function bootMachine(options: BootMachineOptions): Promise<Machine>
         vmlinux,
         memory: wasm_memory,
         user,
+        maximum_user_memory_pages,
         user_copy_status: null,
       });
       return 0;
