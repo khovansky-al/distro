@@ -105,6 +105,38 @@ console.log(await new Response(request.stdout).text());
 network.close();
 ```
 
+The same adapter can publish an approved native relay port to a TCP listener
+inside one guest:
+
+```js
+const relay = webSocketNetwork({ url: "wss://relay.example.net/" });
+const network = createNetwork(relay);
+const guest = guestAgent();
+const attachment = network.attach(guest);
+await using machine = await bootMachine({
+  cpus: 1,
+  plugins: [root, guest, attachment],
+});
+
+// The native relay must allow --publish 127.0.0.1:12345:8080.
+const publication = await relay.publishTcp(attachment, {
+  relayPort: 12345,
+  guestPort: 8080,
+});
+console.log(`listening on native TCP port ${publication.relayPort}`);
+
+publication.close();
+await publication.closed;
+```
+
+Use relay port `0` with a matching relay policy to request an OS-assigned
+development port; `publication.relayPort` reports the effective port. The
+guest server must bind its Ethernet address or `0.0.0.0`, not only
+`127.0.0.1`. Publication carries raw TCP bytes and does not inherit
+authentication from the reverse proxy serving the relay WebSocket, so the
+published service must provide its own security when it is exposed beyond
+loopback.
+
 Run the companion `lowland-websocket-relay` from
 `packages/websocket-relay`. An HTTPS embedding page must use a `wss:` endpoint;
 the dependency-free relay speaks plain `ws:` and is intended to run behind a

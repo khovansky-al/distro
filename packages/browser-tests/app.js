@@ -144,6 +144,88 @@ globalThis.websocketFetch = async () => {
   }
 };
 
+let publishedHttp;
+
+globalThis.startPublishedHttp = async () => {
+  if (publishedHttp) throw new Error("published HTTP fixture is already running");
+  const response = await fetch("/relay-info.json");
+  if (!response.ok) throw new Error(`WebSocket relay is unavailable: ${response.status}`);
+  const { relayUrl } = await response.json();
+  const relayNetwork = webSocketNetwork({ url: relayUrl });
+  const network = createNetwork(relayNetwork);
+  let agent;
+  let machine;
+  let attachment;
+  let server;
+  let publication;
+  try {
+    agent = guestAgent();
+    attachment = network.attach(agent);
+    machine = await bootMachine({
+      cpus: 1,
+      plugins: [agent, await rootDevice(), attachment],
+    });
+    const fixture = await collectProcess(
+      await agent.exec([
+        "sh",
+        "-c",
+        "mkdir -p /tmp/published-http && " +
+          "printf '%s\\n' 'hello from a published WASM Linux server' > " +
+          "/tmp/published-http/index.html",
+      ]),
+    );
+    if (!fixture.status.success) {
+      throw new Error(`failed to create HTTP fixture: ${fixture.stderr}`);
+    }
+    server = await agent.exec([
+      "/usr/sbin/httpd",
+      "-f",
+      "-p",
+      "0.0.0.0:8080",
+      "-h",
+      "/tmp/published-http",
+    ]);
+    const deadline = Date.now() + 5_000;
+    for (;;) {
+      try {
+        const probe = await attachment.connect({ port: 8080 });
+        probe.close();
+        break;
+      } catch (error) {
+        if (Date.now() >= deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    }
+    publication = await relayNetwork.publishTcp(attachment, {
+      relayPort: 0,
+      guestPort: 8080,
+    });
+    publishedHttp = { machine, network, publication, server };
+    return publication.relayPort;
+  } catch (error) {
+    publication?.close();
+    await publication?.closed.catch(() => {});
+    await server?.close();
+    machine?.close();
+    await machine?.closed.catch(() => {});
+    network.close();
+    throw error;
+  }
+};
+
+globalThis.stopPublishedHttp = async () => {
+  if (!publishedHttp) return;
+  const { machine, network, publication, server } = publishedHttp;
+  publishedHttp = undefined;
+  publication.close();
+  await publication.closed.catch(() => {});
+  await server.kill();
+  await server.status;
+  machine.close();
+  await machine.closed.catch(() => {});
+  network.close();
+};
+
 globalThis.spawnStress = () =>
   withGuest(async (guest) => {
     // One in-guest shell spawning a vfork+exec pair per iteration at full

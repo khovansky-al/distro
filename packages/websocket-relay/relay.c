@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 
+#define _POSIX_C_SOURCE 200809L
+
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
@@ -14,6 +17,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define SUBPROTOCOL "lowland-tcp-v1"
@@ -22,6 +26,9 @@
 #define MESSAGE_LIMIT (1024 * 1024)
 #define TCP_CHUNK 16384
 #define SERVICE_LENGTH 32
+#define CAPABILITY_LENGTH 16
+#define MAX_PENDING_CONNECTIONS 64
+#define PENDING_LIFETIME_SECONDS 45
 
 enum opcode {
 	OP_CONNECT = 0x01,
@@ -29,12 +36,58 @@ enum opcode {
 	OP_DATA = 0x03,
 	OP_FIN = 0x04,
 	OP_RESET = 0x05,
+	OP_BIND = 0x06,
+	OP_ACCEPT = 0x07,
+	OP_REJECT = 0x08,
 	OP_CONNECTED = 0x81,
 	OP_RESOLVED = 0x82,
+	OP_BOUND = 0x83,
+	OP_INCOMING = 0x84,
+	OP_ACCEPTED = 0x85,
 	OP_ERROR = 0xff,
 };
 
 static const char *required_origin;
+
+struct publication;
+
+struct publish_policy {
+	char *address;
+	unsigned int relay_port;
+	unsigned int guest_port;
+	struct publication *active;
+	struct publish_policy *next;
+};
+
+struct pending_connection {
+	unsigned char capability[CAPABILITY_LENGTH];
+	int socket;
+	int64_t expires_at;
+	struct pending_connection *next;
+};
+
+struct active_flow {
+	int socket;
+	int websocket;
+	struct active_flow *next;
+};
+
+struct publication {
+	struct publish_policy *policy;
+	int listener;
+	int websocket;
+	bool closed;
+	unsigned int references;
+	unsigned int pending_count;
+	struct pending_connection *pending;
+	struct active_flow *flows;
+};
+
+static pthread_mutex_t publications_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct publish_policy *publish_policies;
+
+static int listen_socket(const char *host, const char *service);
+static int bound_service(int fd, char service[SERVICE_LENGTH]);
 
 struct sha1 {
 	uint32_t state[5];
@@ -556,22 +609,12 @@ static int connect_socket(const char *host, unsigned int port)
 	return fd;
 }
 
-static int relay_tcp(int websocket, const unsigned char *request, size_t length)
+static int relay_socket(int websocket, int upstream, unsigned int ready_opcode)
 {
 	unsigned char buffer[TCP_CHUNK];
-	unsigned int port;
-	char *host;
-	int upstream;
 	bool websocket_finished = false, upstream_finished = false;
 
-	if (length < 4 || (port = (unsigned int)request[1] << 8 | request[2]) == 0 ||
-	    !(host = message_host(request, 3, length)))
-		return protocol_error(websocket, "invalid CONNECT request");
-	upstream = connect_socket(host, port);
-	free(host);
-	if (upstream < 0)
-		return protocol_error(websocket, "upstream TCP connection failed");
-	if (protocol_message(websocket, OP_CONNECTED, NULL, 0) < 0)
+	if (protocol_message(websocket, ready_opcode, NULL, 0) < 0)
 		goto failure;
 	while (!websocket_finished || !upstream_finished) {
 		fd_set readable;
@@ -631,12 +674,390 @@ static int relay_tcp(int websocket, const unsigned char *request, size_t length)
 			}
 		}
 	}
-	close(upstream);
 	return 0;
 
 failure:
-	close(upstream);
 	return -1;
+}
+
+static int relay_tcp(int websocket, const unsigned char *request, size_t length)
+{
+	unsigned int port;
+	char *host;
+	int upstream;
+
+	if (length < 4 || (port = (unsigned int)request[1] << 8 | request[2]) == 0 ||
+	    !(host = message_host(request, 3, length)))
+		return protocol_error(websocket, "invalid CONNECT request");
+	upstream = connect_socket(host, port);
+	free(host);
+	if (upstream < 0)
+		return protocol_error(websocket, "upstream TCP connection failed");
+	{
+		int status = relay_socket(websocket, upstream, OP_CONNECTED);
+
+		close(upstream);
+		return status;
+	}
+}
+
+static int random_capability(unsigned char capability[CAPABILITY_LENGTH])
+{
+	int random = open("/dev/urandom", O_RDONLY);
+	size_t used = 0;
+
+	if (random < 0)
+		return -1;
+	while (used < CAPABILITY_LENGTH) {
+		ssize_t amount = read(random, capability + used,
+				      CAPABILITY_LENGTH - used);
+
+		if (amount < 0 && errno == EINTR)
+			continue;
+		if (amount <= 0) {
+			close(random);
+			return -1;
+		}
+		used += (size_t)amount;
+	}
+	close(random);
+	return 0;
+}
+
+static int64_t monotonic_milliseconds(void)
+{
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+		return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+	return (int64_t)time(NULL) * 1000;
+}
+
+static bool capability_exists_locked(const unsigned char capability[CAPABILITY_LENGTH])
+{
+	struct publish_policy *policy;
+
+	for (policy = publish_policies; policy; policy = policy->next) {
+		struct pending_connection *pending;
+
+		if (!policy->active)
+			continue;
+		for (pending = policy->active->pending; pending; pending = pending->next) {
+			if (memcmp(pending->capability, capability, CAPABILITY_LENGTH) == 0)
+				return true;
+		}
+	}
+	return false;
+}
+
+static void release_publication_locked(struct publication *publication)
+{
+	publication->references--;
+	if (publication->references == 0)
+		free(publication);
+}
+
+static void close_publication(struct publication *publication)
+{
+	struct pending_connection *pending;
+	struct active_flow *flow;
+
+	pthread_mutex_lock(&publications_mutex);
+	if (publication->closed) {
+		pthread_mutex_unlock(&publications_mutex);
+		return;
+	}
+	publication->closed = true;
+	if (publication->listener >= 0) {
+		close(publication->listener);
+		publication->listener = -1;
+	}
+	if (publication->policy->active == publication)
+		publication->policy->active = NULL;
+	pending = publication->pending;
+	publication->pending = NULL;
+	publication->pending_count = 0;
+	while (pending) {
+		struct pending_connection *next = pending->next;
+
+		close(pending->socket);
+		free(pending);
+		pending = next;
+	}
+	for (flow = publication->flows; flow; flow = flow->next) {
+		shutdown(flow->socket, SHUT_RDWR);
+		shutdown(flow->websocket, SHUT_RDWR);
+	}
+	release_publication_locked(publication);
+	pthread_mutex_unlock(&publications_mutex);
+}
+
+static void remove_active_flow(struct publication *publication,
+			       struct active_flow *flow)
+{
+	struct active_flow **link;
+
+	pthread_mutex_lock(&publications_mutex);
+	for (link = &publication->flows; *link && *link != flow; link = &(*link)->next)
+		;
+	if (*link == flow) {
+		*link = flow->next;
+		release_publication_locked(publication);
+	}
+	pthread_mutex_unlock(&publications_mutex);
+}
+
+static struct publication *claim_pending(
+	const unsigned char capability[CAPABILITY_LENGTH], struct active_flow *flow)
+{
+	struct publish_policy *policy;
+	int64_t now = monotonic_milliseconds();
+
+	pthread_mutex_lock(&publications_mutex);
+	for (policy = publish_policies; policy; policy = policy->next) {
+		struct publication *publication = policy->active;
+		struct pending_connection **link;
+
+		if (!publication || publication->closed)
+			continue;
+		for (link = &publication->pending; *link; link = &(*link)->next) {
+			struct pending_connection *pending = *link;
+
+			if (memcmp(pending->capability, capability,
+				   CAPABILITY_LENGTH) != 0)
+				continue;
+			*link = pending->next;
+			publication->pending_count--;
+			if (pending->expires_at <= now) {
+				close(pending->socket);
+				free(pending);
+				pthread_mutex_unlock(&publications_mutex);
+				return NULL;
+			}
+			flow->socket = pending->socket;
+			flow->next = publication->flows;
+			publication->flows = flow;
+			publication->references++;
+			free(pending);
+			pthread_mutex_unlock(&publications_mutex);
+			return publication;
+		}
+	}
+	pthread_mutex_unlock(&publications_mutex);
+	return NULL;
+}
+
+static bool reject_pending(struct publication *publication,
+			   const unsigned char capability[CAPABILITY_LENGTH])
+{
+	struct pending_connection **link;
+
+	pthread_mutex_lock(&publications_mutex);
+	for (link = &publication->pending; *link; link = &(*link)->next) {
+		struct pending_connection *pending = *link;
+
+		if (memcmp(pending->capability, capability, CAPABILITY_LENGTH) != 0)
+			continue;
+		*link = pending->next;
+		publication->pending_count--;
+		close(pending->socket);
+		free(pending);
+		pthread_mutex_unlock(&publications_mutex);
+		return true;
+	}
+	pthread_mutex_unlock(&publications_mutex);
+	return false;
+}
+
+static void expire_pending(struct publication *publication)
+{
+	struct pending_connection **link;
+	int64_t now = monotonic_milliseconds();
+
+	pthread_mutex_lock(&publications_mutex);
+	for (link = &publication->pending; *link;) {
+		struct pending_connection *pending = *link;
+
+		if (pending->expires_at > now) {
+			link = &pending->next;
+			continue;
+		}
+		*link = pending->next;
+		publication->pending_count--;
+		close(pending->socket);
+		free(pending);
+	}
+	pthread_mutex_unlock(&publications_mutex);
+}
+
+static int queue_incoming(struct publication *publication)
+{
+	struct pending_connection *pending;
+	unsigned char message[1 + CAPABILITY_LENGTH];
+	int incoming = accept(publication->listener, NULL, NULL);
+
+	if (incoming < 0)
+		return errno == EINTR ? 0 : -1;
+#ifdef SO_NOSIGPIPE
+	{
+		int enabled = 1;
+		setsockopt(incoming, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+	}
+#endif
+	pending = calloc(1, sizeof(*pending));
+	if (!pending) {
+		close(incoming);
+		return 0;
+	}
+	pending->socket = incoming;
+	pending->expires_at = monotonic_milliseconds() +
+			      PENDING_LIFETIME_SECONDS * 1000;
+	if (random_capability(pending->capability) < 0) {
+		close(incoming);
+		free(pending);
+		return 0;
+	}
+	pthread_mutex_lock(&publications_mutex);
+	if (publication->closed ||
+	    publication->pending_count >= MAX_PENDING_CONNECTIONS ||
+	    capability_exists_locked(pending->capability)) {
+		pthread_mutex_unlock(&publications_mutex);
+		close(incoming);
+		free(pending);
+		return 0;
+	}
+	pending->next = publication->pending;
+	publication->pending = pending;
+	publication->pending_count++;
+	message[0] = OP_INCOMING;
+	memcpy(message + 1, pending->capability, CAPABILITY_LENGTH);
+	pthread_mutex_unlock(&publications_mutex);
+	return websocket_send(publication->websocket, 0x2, message, sizeof(message));
+}
+
+static int relay_accepted(int websocket, const unsigned char *request, size_t length)
+{
+	struct active_flow flow = { .websocket = websocket };
+	struct publication *publication;
+	int status;
+
+	if (length != 1 + CAPABILITY_LENGTH)
+		return protocol_error(websocket, "invalid ACCEPT request");
+	publication = claim_pending(request + 1, &flow);
+	if (!publication)
+		return protocol_error(websocket, "pending connection is unavailable");
+	status = relay_socket(websocket, flow.socket, OP_ACCEPTED);
+	remove_active_flow(publication, &flow);
+	close(flow.socket);
+	return status;
+}
+
+static int relay_bind(int websocket, const unsigned char *request, size_t length)
+{
+	struct publication *publication;
+	struct publish_policy *policy;
+	unsigned int relay_port, guest_port, effective_port;
+	unsigned char response[3] = { OP_BOUND };
+	char service[SERVICE_LENGTH];
+	int status = 0;
+
+	if (length != 5)
+		return protocol_error(websocket, "invalid BIND request");
+	relay_port = (unsigned int)request[1] << 8 | request[2];
+	guest_port = (unsigned int)request[3] << 8 | request[4];
+	if (guest_port == 0)
+		return protocol_error(websocket, "invalid BIND request");
+	publication = calloc(1, sizeof(*publication));
+	if (!publication)
+		return protocol_error(websocket, "relay is out of memory");
+	publication->listener = -1;
+	publication->websocket = websocket;
+	publication->references = 1;
+	pthread_mutex_lock(&publications_mutex);
+	for (policy = publish_policies; policy; policy = policy->next) {
+		if (policy->relay_port == relay_port && policy->guest_port == guest_port)
+			break;
+	}
+	if (!policy || policy->active) {
+		pthread_mutex_unlock(&publications_mutex);
+		free(publication);
+		return protocol_error(websocket,
+			policy ? "publication is already active" :
+				 "requested publication is not approved");
+	}
+	publication->policy = policy;
+	policy->active = publication;
+	pthread_mutex_unlock(&publications_mutex);
+
+	snprintf(service, sizeof(service), "%u", relay_port);
+	publication->listener = listen_socket(policy->address, service);
+	if (publication->listener < 0 ||
+	    bound_service(publication->listener, service) != 0) {
+		close_publication(publication);
+		return protocol_error(websocket, "approved TCP listener could not be bound");
+	}
+	effective_port = (unsigned int)strtoul(service, NULL, 10);
+	if (effective_port == 0 || effective_port > 65535) {
+		close_publication(publication);
+		return protocol_error(websocket, "relay returned an invalid listener port");
+	}
+	response[1] = effective_port >> 8;
+	response[2] = effective_port;
+	if (websocket_send(websocket, 0x2, response, sizeof(response)) < 0) {
+		close_publication(publication);
+		return -1;
+	}
+
+	for (;;) {
+		fd_set readable;
+		struct timeval timeout = { .tv_sec = 1 };
+		int maximum = websocket > publication->listener ?
+			      websocket : publication->listener;
+		int selected;
+
+		expire_pending(publication);
+		FD_ZERO(&readable);
+		FD_SET(websocket, &readable);
+		FD_SET(publication->listener, &readable);
+		selected = select(maximum + 1, &readable, NULL, NULL, &timeout);
+		if (selected < 0) {
+			if (errno == EINTR)
+				continue;
+			status = -1;
+			break;
+		}
+		if (selected == 0)
+			continue;
+		if (FD_ISSET(publication->listener, &readable) &&
+		    queue_incoming(publication) < 0) {
+			status = -1;
+			break;
+		}
+		if (FD_ISSET(websocket, &readable)) {
+			unsigned char *message = NULL;
+			size_t message_length = 0;
+			int read_status = websocket_read(websocket, &message,
+							 &message_length);
+
+			if (read_status <= 0) {
+				free(message);
+				status = read_status;
+				break;
+			}
+			if (message_length != 1 + CAPABILITY_LENGTH ||
+			    message[0] != OP_REJECT) {
+				protocol_error(websocket, "invalid REJECT request");
+				free(message);
+				status = -1;
+				break;
+			}
+			/* Expiry can race a delayed guest refusal; REJECT is idempotent. */
+			reject_pending(publication, message + 1);
+			free(message);
+		}
+	}
+	close_publication(publication);
+	return status;
 }
 
 static void *serve_client(void *argument)
@@ -658,6 +1079,10 @@ static void *serve_client(void *argument)
 		resolve_request(fd, message, length);
 	else if (message[0] == OP_CONNECT)
 		relay_tcp(fd, message, length);
+	else if (message[0] == OP_BIND)
+		relay_bind(fd, message, length);
+	else if (message[0] == OP_ACCEPT)
+		relay_accepted(fd, message, length);
 	else
 		protocol_error(fd, "unsupported initial opcode");
 
@@ -694,10 +1119,104 @@ static int listen_socket(const char *host, const char *service)
 	return fd;
 }
 
+static char *copy_range(const char *start, size_t length)
+{
+	char *copy = malloc(length + 1);
+
+	if (!copy)
+		return NULL;
+	memcpy(copy, start, length);
+	copy[length] = '\0';
+	return copy;
+}
+
+static int parse_port_range(const char *start, size_t length, bool allow_zero,
+			    unsigned int *result)
+{
+	unsigned long value = 0;
+	size_t index;
+
+	if (length == 0)
+		return -1;
+	for (index = 0; index < length; index++) {
+		if (start[index] < '0' || start[index] > '9')
+			return -1;
+		value = value * 10 + (unsigned int)(start[index] - '0');
+		if (value > 65535)
+			return -1;
+	}
+	if (!allow_zero && value == 0)
+		return -1;
+	*result = (unsigned int)value;
+	return 0;
+}
+
+static int add_publish_policy(const char *mapping)
+{
+	const char *address_start = "127.0.0.1", *relay_start, *guest_start;
+	const char *first, *second;
+	size_t address_length = strlen(address_start), relay_length;
+	struct publish_policy *policy, *current;
+
+	if (mapping[0] == '[') {
+		const char *closing = strchr(mapping + 1, ']');
+
+		if (!closing || closing == mapping + 1 || closing[1] != ':')
+			return -1;
+		address_start = mapping + 1;
+		address_length = (size_t)(closing - address_start);
+		relay_start = closing + 2;
+	} else {
+		first = strchr(mapping, ':');
+		if (!first)
+			return -1;
+		second = strchr(first + 1, ':');
+		if (second) {
+			if (first == mapping || strchr(second + 1, ':'))
+				return -1;
+			address_start = mapping;
+			address_length = (size_t)(first - mapping);
+			relay_start = first + 1;
+		} else {
+			relay_start = mapping;
+		}
+	}
+	first = strchr(relay_start, ':');
+	if (!first || strchr(first + 1, ':'))
+		return -1;
+	relay_length = (size_t)(first - relay_start);
+	guest_start = first + 1;
+	policy = calloc(1, sizeof(*policy));
+	if (!policy)
+		return -1;
+	policy->address = copy_range(address_start, address_length);
+	if (!policy->address ||
+	    parse_port_range(relay_start, relay_length, true, &policy->relay_port) < 0 ||
+	    parse_port_range(guest_start, strlen(guest_start), false,
+			     &policy->guest_port) < 0) {
+		free(policy->address);
+		free(policy);
+		return -1;
+	}
+	for (current = publish_policies; current; current = current->next) {
+		/* BIND selects by port pair; requiring uniqueness keeps address policy exact. */
+		if (current->relay_port == policy->relay_port &&
+		    current->guest_port == policy->guest_port) {
+			free(policy->address);
+			free(policy);
+			return -1;
+		}
+	}
+	policy->next = publish_policies;
+	publish_policies = policy;
+	return 0;
+}
+
 static void usage(const char *program)
 {
 	fprintf(stderr,
-		"usage: %s [--listen ADDRESS] [--port PORT] [--origin URL]\n",
+		"usage: %s [--listen ADDRESS] [--port PORT] [--origin URL] "
+		"[--publish [ADDRESS:]RELAY_PORT:GUEST_PORT]...\n",
 		program);
 }
 
@@ -728,6 +1247,12 @@ int main(int argc, char **argv)
 			port = argv[++index];
 		else if (strcmp(argv[index], "--origin") == 0)
 			required_origin = argv[++index];
+		else if (strcmp(argv[index], "--publish") == 0) {
+			if (add_publish_policy(argv[++index]) < 0) {
+				fprintf(stderr, "invalid --publish mapping: %s\n", argv[index]);
+				return 2;
+			}
+		}
 		else {
 			usage(argv[0]);
 			return 2;

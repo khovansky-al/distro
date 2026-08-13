@@ -1,8 +1,9 @@
 # Lowland TCP WebSocket protocol v1
 
-The client opens one WebSocket per DNS lookup or TCP flow and requests the
-subprotocol `lowland-tcp-v1`. Every application message is binary. Multibyte
-integers use network byte order.
+The client opens one WebSocket per DNS lookup, outbound TCP flow, publication
+control channel, or accepted inbound TCP flow and requests the subprotocol
+`lowland-tcp-v1`. Every application message is binary. Multibyte integers use
+network byte order.
 
 The first byte is an opcode:
 
@@ -13,16 +14,38 @@ The first byte is an opcode:
 | `0x03` DATA | either | opaque TCP bytes |
 | `0x04` FIN | either | empty; half-closes that direction |
 | `0x05` RESET | either | empty; aborts the flow |
+| `0x06` BIND | client → relay | requested relay port (`u16`), guest port (`u16`) |
+| `0x07` ACCEPT | client → relay | pending-connection capability (16 bytes) |
+| `0x08` REJECT | publication client → relay | pending-connection capability (16 bytes) |
 | `0x81` CONNECTED | relay → client | empty |
 | `0x82` RESOLVED | relay → client | one or more packed IPv4 addresses |
+| `0x83` BOUND | relay → client | effective relay port (`u16`) |
+| `0x84` INCOMING | relay → publication client | pending-connection capability (16 bytes) |
+| `0x85` ACCEPTED | relay → client | empty |
 | `0xff` ERROR | relay → client | human-readable UTF-8 diagnostic |
 
 The relay resolves only IPv4 because the current WASM kernel guest network is
 IPv4-only. CONNECT accepts a hostname or numeric address.
 
-Opcodes `0x06` through `0x0f` and `0x83` through `0x8f` are reserved for a
-future BIND/LISTEN/ACCEPT extension. Keeping connection setup distinct from
-DATA and preserving TCP half-close semantics means that extension can expose
-accepted sockets without changing existing flow messages.
+## Published TCP listeners
 
+A publication starts with BIND as the first message on a persistent control
+WebSocket. The relay accepts it only when the port pair exactly matches a
+configured `--publish` policy and that policy has no active publication. Relay
+port zero selects a policy whose configured relay port is zero and asks the OS
+for an ephemeral port. BOUND reports the effective nonzero port.
+
+Each accepted native TCP socket is retained for at most 45 seconds while the
+relay sends INCOMING with an unguessable capability on the control channel.
+There may be at most 64 pending sockets per publication. The client first
+connects to the guest listener. If that connection fails, it sends REJECT on
+the control channel. Otherwise it opens a new WebSocket, sends ACCEPT as its
+first message, and waits for ACCEPTED before carrying data.
+
+After ACCEPTED, the flow uses the same DATA, FIN, RESET, and WebSocket-close
+semantics as an outbound connection. Capabilities are single-use and scoped to
+the live listener that created them. Closing the publication control WebSocket
+closes the listener and every pending socket, and resets all accepted flows.
 WebSocket transport closure without a protocol FIN is treated as a reset.
+
+Opcodes `0x09` through `0x0f` and `0x86` through `0x8f` remain reserved.

@@ -59,7 +59,11 @@
         To give the guest raw TCP access, add a URL-encoded WebSocket endpoint as the
         <code>relay</code> query parameter, for example
         <code>?relay=wss%3A%2F%2Frelay.example.net%2F</code>. Without it, the demo retains its
-        fetch-based HTTP adapter.
+        fetch-based HTTP adapter. Approved inbound mappings can be requested repeatedly with
+        <code>publish=RELAY_PORT:GUEST_PORT</code>, for example <code>&amp;publish=12345:80</code>.
+        The guest service must bind its Ethernet address or <code>0.0.0.0</code>, not only
+        <code>127.0.0.1</code>. Published ports carry raw TCP and bypass reverse-proxy
+        authentication, so the service must protect itself when exposed beyond loopback.
       </p>
     </details>
     <script>
@@ -127,7 +131,21 @@
         }
       }
 
-      const parameters = Object.fromEntries(new URLSearchParams(location.search));
+      const searchParameters = new URLSearchParams(location.search);
+      const parameters = Object.fromEntries(searchParameters);
+      const publicationMappings = searchParameters.getAll("publish").map((mapping) => {
+        const match = mapping.match(/^(0|[1-9][0-9]{0,4}):([1-9][0-9]{0,4})$/);
+        if (!match) throw new Error(`invalid TCP publication mapping: ${mapping}`);
+        const relayPort = Number(match[1]);
+        const guestPort = Number(match[2]);
+        if (relayPort > 65535 || guestPort > 65535) {
+          throw new Error(`invalid TCP publication mapping: ${mapping}`);
+        }
+        return { relayPort, guestPort };
+      });
+      if (publicationMappings.length && !parameters.relay) {
+        throw new Error("TCP publication requires a relay query parameter");
+      }
 
       const term = new Terminal({
         convertEol: true,
@@ -304,10 +322,11 @@
       // HTTP request to HTTPS. Keep destination selection in the guest
       // repository configuration; the page must not silently redirect one
       // package server to another.
+      const relayNetwork = parameters.relay
+        ? webSocketNetwork({ url: parameters.relay })
+        : undefined;
       const network = createNetwork(
-        parameters.relay
-          ? webSocketNetwork({ url: parameters.relay })
-          : hostFetchNetwork({ fetch: (request) => fetch(request) }),
+        relayNetwork ?? hostFetchNetwork({ fetch: (request) => fetch(request) }),
       );
 
       const disk =
@@ -348,6 +367,27 @@
         plugins,
       });
       void machine.bootConsole.pipeTo(bootOut).catch(() => {});
+      const publications = [];
+      try {
+        for (const mapping of publicationMappings) {
+          const publication = await relayNetwork.publishTcp(networkAttachment, mapping);
+          publications.push(publication);
+          term.write(
+            `\r\nPublished relay TCP port ${publication.relayPort} to guest port ${publication.guestPort}\r\n`,
+          );
+          void publication.closed.catch(reportError);
+        }
+      } catch (error) {
+        for (const publication of publications) publication.close();
+        throw error;
+      }
+      addEventListener(
+        "pagehide",
+        () => {
+          for (const publication of publications) publication.close();
+        },
+        { once: true },
+      );
       if (bootDirectory) {
         await guest.fs.mkdir("/boot", { recursive: true });
         await guest.mount("boot", "/boot", { type: "virtiofs" });

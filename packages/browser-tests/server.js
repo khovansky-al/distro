@@ -11,9 +11,13 @@ let relayProcess;
 let relayUrl;
 
 async function startRelay(command) {
-  relayProcess = spawn(command, ["--listen", "127.0.0.1", "--port", "0"], {
-    stdio: ["ignore", "pipe", "inherit"],
-  });
+  relayProcess = spawn(
+    command,
+    ["--listen", "127.0.0.1", "--port", "0", "--publish", "127.0.0.1:0:8080"],
+    {
+      stdio: ["ignore", "pipe", "inherit"],
+    },
+  );
   let output = "";
   const ready = Promise.withResolvers();
   relayProcess.stdout.setEncoding("utf8");

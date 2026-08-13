@@ -20,7 +20,13 @@ export {
 } from "./file.ts";
 export { guestFetchHandler } from "./guest-fetch-handler.ts";
 export { hostFetchNetwork } from "./host-fetch-network.ts";
-export { webSocketNetwork, type WebSocketNetworkOptions } from "./websocket-network.ts";
+export {
+  type TcpPublication,
+  type TcpPublicationOptions,
+  type WebSocketNetwork,
+  type WebSocketNetworkOptions,
+  webSocketNetwork,
+} from "./websocket-network.ts";
 export {
   createNetwork,
   type Network,
