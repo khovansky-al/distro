@@ -54,6 +54,13 @@
         <a href="https://github.com/tombl/distro">github.com/tombl/distro</a> (the userspace and
         this site).
       </p>
+
+      <p>
+        To give the guest raw TCP access, add a URL-encoded WebSocket endpoint as the
+        <code>relay</code> query parameter, for example
+        <code>?relay=wss%3A%2F%2Frelay.example.net%2F</code>. Without it, the demo retains its
+        fetch-based HTTP adapter.
+      </p>
     </details>
     <script>
       function reportError(error) {
@@ -89,6 +96,7 @@
         guestFetchHandler,
         guestAgent,
         hostFetchNetwork,
+        webSocketNetwork,
       } from "@lowland/guest";
       import {
         blockDevice,
@@ -292,10 +300,15 @@
         }
       }
 
-      // The host adapter upgrades the guest's plaintext HTTP request to HTTPS.
-      // Keep destination selection in the guest repository configuration; the
-      // page must not silently redirect one package server to another.
-      const network = createNetwork(hostFetchNetwork({ fetch: (request) => fetch(request) }));
+      // Without a raw relay, the host adapter upgrades the guest's plaintext
+      // HTTP request to HTTPS. Keep destination selection in the guest
+      // repository configuration; the page must not silently redirect one
+      // package server to another.
+      const network = createNetwork(
+        parameters.relay
+          ? webSocketNetwork({ url: parameters.relay })
+          : hostFetchNetwork({ fetch: (request) => fetch(request) }),
+      );
 
       const disk =
         bootMode === "live"

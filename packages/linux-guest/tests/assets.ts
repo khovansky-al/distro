@@ -91,6 +91,9 @@ export const getdents_inode = await readFile(join(directory, "getdents-inode"));
 
 const lifecycle_rootfs = await readFile(join(directory, "lifecycle-rootfs.erofs"));
 
+/** Native WebSocket-to-TCP relay used by host and browser integration tests. */
+export const websocket_relay = join(directory, "lowland-websocket-relay");
+
 export const lifecycle_assets = {
   initramfs: await readFile(join(directory, "boot-initramfs.cpio")),
   root: () =>

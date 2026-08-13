@@ -84,6 +84,33 @@ The attachment contributes the virtio NIC and configures it after the agent is
 ready. Each agent supports one network attachment; attach multiple agents to
 the same network to put them on one private IPv4 subnet.
 
+### Raw browser networking through WebSocket
+
+Browsers cannot open raw TCP sockets. `webSocketNetwork` tunnels each guest DNS
+lookup and TCP flow through a native WebSocket relay while leaving the bytes
+opaque, so HTTP and TLS still run inside Linux:
+
+```js
+import { createNetwork, guestAgent, webSocketNetwork } from "@lowland/guest";
+
+const network = createNetwork(webSocketNetwork({ url: "wss://relay.example.net/" }));
+const guest = guestAgent();
+const attachment = network.attach(guest);
+await using machine = await bootMachine({
+  cpus: 1,
+  plugins: [root, guest, attachment],
+});
+const request = await guest.exec(["wget", "-qO-", "https://example.com/"]);
+console.log(await new Response(request.stdout).text());
+network.close();
+```
+
+Run the companion `lowland-websocket-relay` from
+`packages/websocket-relay`. An HTTPS embedding page must use a `wss:` endpoint;
+the dependency-free relay speaks plain `ws:` and is intended to run behind a
+TLS reverse proxy. Treat it as a security-sensitive forward proxy and require
+authentication before exposing it beyond a trusted network.
+
 ## Host directory adapters
 
 `@lowland/guest/node` provides `NodeFS`, and

@@ -5,7 +5,7 @@ import {
   fileSystemDevice,
   workerDevice,
 } from "@lowland/kernel";
-import { guestAgent } from "@lowland/guest";
+import { createNetwork, guestAgent, webSocketNetwork } from "@lowland/guest";
 import { BrowserFS } from "@lowland/guest/browser";
 
 async function collectProcess(child) {
@@ -55,9 +55,15 @@ async function opfsDiskDevice(handle, capacity) {
 // Scenarios return plain JSON so specs assert on the result directly.
 async function withGuest(scenario, options) {
   const agent = guestAgent();
+  const network = options?.network?.attach(agent);
   const machine = await bootMachine({
     cpus: options?.cpus ?? 1,
-    plugins: [agent, ...(options?.devices ?? []), await rootDevice()],
+    plugins: [
+      agent,
+      ...(options?.devices ?? []),
+      await rootDevice(),
+      ...(network ? [network] : []),
+    ],
   });
   try {
     return await scenario(agent);
@@ -111,6 +117,30 @@ globalThis.opfsWorkerDiskRoundTrip = async () => {
     return { marker, write, read };
   } finally {
     await directory.removeEntry(name);
+  }
+};
+
+globalThis.websocketFetch = async () => {
+  const response = await fetch("/relay-info.json");
+  if (!response.ok) throw new Error(`WebSocket relay is unavailable: ${response.status}`);
+  const { relayUrl, targetPort } = await response.json();
+  const network = createNetwork(webSocketNetwork({ url: relayUrl }));
+  try {
+    return await withGuest(
+      async (guest) =>
+        collectProcess(
+          await guest.exec([
+            "wget",
+            "-qO-",
+            // The virtual gateway maps to host loopback. Guest localhost
+            // would stay entirely inside Linux and never reach the adapter.
+            `http://${network.gateway}:${targetPort}/relay-fixture`,
+          ]),
+        ),
+      { network },
+    );
+  } finally {
+    network.close();
   }
 };
 

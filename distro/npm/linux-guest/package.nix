@@ -11,6 +11,7 @@
   node-workspace,
   stdenv,
   vm-test,
+  websocket-relay,
 }:
 
 let
@@ -51,6 +52,7 @@ let
     "network-test" = "${network-test}/bin/network-test";
     "user-trap" = "${user-trap}/bin/user-trap";
     "getdents-inode" = "${getdents-inode}/bin/getdents-inode";
+    "lowland-websocket-relay" = "${websocket-relay}/bin/lowland-websocket-relay";
   };
 
   package = pkgs.stdenvNoCC.mkDerivation {

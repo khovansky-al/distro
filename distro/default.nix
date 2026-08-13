@@ -46,6 +46,7 @@ lib.makeScope (scope: lib.callPackageWith ({ inherit lib pkgs; } // scope)) (
     llvm-runtimes = callPackage ./llvm-runtimes/package.nix { };
     llvm-toolchain = callPackage ./llvm-toolchain/package.nix { };
     linux = callPackage ./linux/package.nix { };
+    websocket-relay = callPackage ./websocket-relay/package.nix { };
     bytes = callPackage ./npm/bytes.nix { };
     kernel = callPackage ./npm/kernel.nix { };
     musl = callPackage ./musl/package.nix { };

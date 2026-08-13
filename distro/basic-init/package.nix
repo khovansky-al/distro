@@ -182,6 +182,7 @@ in
       signal-syscall-return = signalSyscallReturnCheck "plain" "";
       signal-syscall-return-sjlj = signalSyscallReturnCheck "sjlj" "-DUSE_SJLJ";
       signal-correctness = installedCheck { name = "signal-correctness"; };
+      socket = installedCheck { name = "socket"; };
       sigsetjmp = sigsetjmpCheck;
       sigsetjmp-handler = sigsetjmpHandlerCheck;
       pthread-no-tls = installedCheck { name = "pthread-no-tls"; };

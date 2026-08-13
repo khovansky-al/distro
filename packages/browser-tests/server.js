@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createReadStream, statSync } from "node:fs";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import { createServer } from "node:http";
@@ -6,8 +7,40 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const root = process.cwd();
+let relayProcess;
+let relayUrl;
+
+async function startRelay(command) {
+  relayProcess = spawn(command, ["--listen", "127.0.0.1", "--port", "0"], {
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+  let output = "";
+  const ready = Promise.withResolvers();
+  relayProcess.stdout.setEncoding("utf8");
+  relayProcess.stdout.on("data", (chunk) => {
+    output += chunk;
+    const match = output.match(/Listening on (ws:\/\/[^\s]+)/);
+    if (match) ready.resolve(match[1]);
+  });
+  relayProcess.once("error", ready.reject);
+  relayProcess.once("exit", (code, signal) => {
+    ready.reject(
+      new Error(
+        `WebSocket relay exited before listening (code ${code}, signal ${signal}): ${output}`,
+      ),
+    );
+  });
+  return ready.promise;
+}
+
+if (process.env.WEBSOCKET_RELAY) {
+  relayUrl = await startRelay(process.env.WEBSOCKET_RELAY);
+}
+
+process.once("exit", () => relayProcess?.kill());
 const types = {
   ".cpio": "application/octet-stream",
+  ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".erofs": "application/octet-stream",
@@ -37,6 +70,32 @@ function build(attribute) {
 
 const server = createServer(async (request, response) => {
   const pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+  if (pathname === "/relay-info.json") {
+    if (!relayUrl) {
+      response.writeHead(404).end();
+      return;
+    }
+    const body = JSON.stringify({
+      relayUrl,
+      targetPort: server.address().port,
+    });
+    response.writeHead(200, {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body),
+    });
+    response.end(body);
+    return;
+  }
+  if (pathname === "/relay-fixture") {
+    const body = "hello from the browser WebSocket relay\n";
+    response.writeHead(200, {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Length": Buffer.byteLength(body),
+      Connection: "close",
+    });
+    response.end(body);
+    return;
+  }
   const relative = normalize(pathname === "/" ? "index.html" : pathname.slice(1));
   let path = join(root, relative);
   if (!path.startsWith(`${root}/`)) {
