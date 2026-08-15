@@ -1,0 +1,383 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4ae3313c..84acb19d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -97,0 +98,2 @@ elseif(EDGE_NAPI_PROVIDER STREQUAL "quickjs")
++  set(NAPI_QUICKJS_DEFINES "NAPI_EXTENSION_WASMER_EXTERN=" CACHE STRING
++    "Compile definitions for the embedded QuickJS N-API provider" FORCE)
+@@ -167 +169,5 @@ elseif(EDGE_NAPI_PROVIDER STREQUAL "quickjs")
+-  target_compile_definitions(edge_environment_core PUBLIC EDGE_EMBEDDED_NAPI_PROVIDER=1 NAPI_EXTERN=)
++  target_compile_definitions(edge_environment_core PUBLIC
++    EDGE_EMBEDDED_NAPI_PROVIDER=1
++    NAPI_EXTERN=
++    NAPI_EXTENSION_WASMER_EXTERN=
++  )
+diff --git a/cmake/EdgeICU.cmake b/cmake/EdgeICU.cmake
+index cca71af4..f22c2bc6 100644
+--- a/cmake/EdgeICU.cmake
++++ b/cmake/EdgeICU.cmake
+@@ -26,0 +27,5 @@ function(edge_configure_icu)
++    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^wasm")
++      # Linux/wasm intentionally has no mmap ABI; ICU's stdio loader is its
++      # supported fallback and works with the embedded common-data archive.
++      list(APPEND EDGE_ICU_BASE_DEFINES U_HAVE_MMAP=0)
++    endif()
+diff --git a/deps/llhttp/src/api.c b/deps/llhttp/src/api.c
+index 8ddc6772..69f4948c 100644
+--- a/deps/llhttp/src/api.c
++++ b/deps/llhttp/src/api.c
+@@ -42 +42 @@ void llhttp_init(llhttp_t* parser, llhttp_type_t type,
+-#if defined(__wasm__) && !defined(__wasi__)
++#if defined(__wasm__) && !defined(__wasi__) && !defined(__linux__)
+@@ -81 +81 @@ void llhttp_free(llhttp_t* parser) {
+-#endif  // defined(__wasm__) && !defined(__wasi__)
++#endif  // defined(__wasm__) && !defined(__wasi__) && !defined(__linux__)
+diff --git a/deps/uv/src/unix/linux.c b/deps/uv/src/unix/linux.c
+index ea3e2de0..6f1676fc 100644
+--- a/deps/uv/src/unix/linux.c
++++ b/deps/uv/src/unix/linux.c
+@@ -46 +46,3 @@
+-#include <sys/mman.h>
++#if !defined(__wasm__)
++# include <sys/mman.h>
++#endif
+@@ -501,0 +504,17 @@ static int uv__use_io_uring(uint32_t flags) {
++#if defined(__wasm__)
++static void uv__iou_init(int epollfd,
++                         struct uv__iou* iou,
++                         uint32_t entries,
++                         uint32_t flags) {
++  (void) epollfd;
++  (void) entries;
++  (void) flags;
++  /* The wasm Linux ABI has no mmap, so libuv uses its epoll/threadpool path. */
++  iou->ringfd = -1;
++}
++
++
++static void uv__iou_delete(struct uv__iou* iou) {
++  iou->ringfd = -1;
++}
++#else
+@@ -637,0 +657 @@ static void uv__iou_delete(struct uv__iou* iou) {
++#endif
+diff --git a/deps/uv/src/unix/process.c b/deps/uv/src/unix/process.c
+index 43e6b798..a78c4e47 100644
+--- a/deps/uv/src/unix/process.c
++++ b/deps/uv/src/unix/process.c
+@@ -38 +38 @@
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__wasm__)
+@@ -40,0 +41,3 @@
++#endif
++
++#if defined(__APPLE__)
+@@ -420 +423 @@ static void uv__process_child_init(const uv_process_options_t* options,
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(__wasm__)
+@@ -427 +430 @@ typedef struct uv__posix_spawn_fncs_tag {
+-
++#if defined(__APPLE__)
+@@ -466,0 +470 @@ static void uv__spawn_init_posix_spawn(void) {
++#endif
+@@ -482,0 +487,4 @@ static int uv__spawn_set_posix_spawn_attrs(
++#if defined(__wasm__)
++  (void) posix_spawn_fncs;
++#endif
++
+@@ -491,0 +500,5 @@ static int uv__spawn_set_posix_spawn_attrs(
++#if defined(__wasm__)
++  flags = POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK;
++  if (options->flags & UV_PROCESS_DETACHED)
++    flags |= POSIX_SPAWN_SETSID;
++#else
+@@ -516,0 +530 @@ static int uv__spawn_set_posix_spawn_attrs(
++#endif
+@@ -557,0 +572,4 @@ static int uv__spawn_set_posix_spawn_file_actions(
++#if defined(__wasm__)
++  (void) posix_spawn_fncs;
++#endif
++
+@@ -559,0 +578,3 @@ static int uv__spawn_set_posix_spawn_file_actions(
++#if defined(__wasm__)
++    err = posix_spawn_file_actions_addchdir_np(actions, options->cwd);
++#else
+@@ -565,0 +587 @@ static int uv__spawn_set_posix_spawn_file_actions(
++#endif
+@@ -621 +643,5 @@ static int uv__spawn_set_posix_spawn_file_actions(
+-    if (fd == use_fd)
++    if (fd == use_fd) {
++#if defined(__wasm__)
++        /* POSIX adddup2(fd, fd) clears FD_CLOEXEC in the child. */
++        err = posix_spawn_file_actions_adddup2(actions, fd, fd);
++#else
+@@ -623 +649,2 @@ static int uv__spawn_set_posix_spawn_file_actions(
+-    else
++#endif
++    } else {
+@@ -624,0 +652 @@ static int uv__spawn_set_posix_spawn_file_actions(
++    }
+@@ -818,0 +847 @@ error:
++#if !defined(__wasm__)
+@@ -858,0 +888 @@ static int uv__spawn_and_init_child_fork(const uv_process_options_t* options,
++#endif
+@@ -865,0 +896,8 @@ static int uv__spawn_and_init_child(
++#if defined(__wasm__)
++  (void) loop;
++  return uv__spawn_and_init_child_posix_spawn(options,
++                                              stdio_count,
++                                              pipes,
++                                              pid,
++                                              NULL);
++#else
+@@ -962,0 +1001 @@ static int uv__spawn_and_init_child(
++#endif
+diff --git a/src/edge_cli.cc b/src/edge_cli.cc
+index a86a5d70..8ab5a49f 100644
+--- a/src/edge_cli.cc
++++ b/src/edge_cli.cc
+@@ -1173 +1173 @@ bool StdinSupportsRawMode() {
+-#if defined(__wasi__) || defined(__wasm32__)
++#if defined(__wasi__)
+diff --git a/src/edge_compat_exec.cc b/src/edge_compat_exec.cc
+index 022cff91..1eca7f1a 100644
+--- a/src/edge_compat_exec.cc
++++ b/src/edge_compat_exec.cc
+@@ -15,0 +16,3 @@
++#if defined(__wasm__)
++#include <spawn.h>
++#endif
+@@ -37,0 +41,91 @@ struct CommandResult {
++#if defined(__wasm__)
++int SpawnWithPath(pid_t* pid,
++                  const char* file,
++                  const posix_spawn_file_actions_t* actions,
++                  const posix_spawnattr_t* attrs,
++                  char* const argv[],
++                  char* const envp[],
++                  std::string_view search_path) {
++  if (file == nullptr || file[0] == '\0') return ENOENT;
++  if (std::strchr(file, '/') != nullptr) {
++    int spawn_error;
++    do {
++      spawn_error = posix_spawn(pid, file, actions, attrs, argv, envp);
++    } while (spawn_error == EINTR);
++    return spawn_error;
++  }
++
++  bool saw_eacces = false;
++  size_t begin = 0;
++  while (begin <= search_path.size()) {
++    const size_t end = search_path.find(':', begin);
++    const std::string_view directory =
++        search_path.substr(begin, end == std::string_view::npos ? end : end - begin);
++    std::string candidate;
++    if (directory.empty()) {
++      candidate = file;
++    } else {
++      candidate.reserve(directory.size() + 1 + std::strlen(file));
++      candidate.append(directory);
++      candidate.push_back('/');
++      candidate.append(file);
++    }
++
++    int spawn_error;
++    do {
++      spawn_error = posix_spawn(pid, candidate.c_str(), actions, attrs, argv, envp);
++    } while (spawn_error == EINTR);
++    if (spawn_error == 0) return 0;
++    if (spawn_error == EACCES) {
++      saw_eacces = true;
++    } else if (spawn_error != ENOENT && spawn_error != ENOTDIR) {
++      return spawn_error;
++    }
++
++    if (end == std::string_view::npos) break;
++    begin = end + 1;
++  }
++
++  return saw_eacces ? EACCES : ENOENT;
++}
++
++std::vector<char*> BuildArgv(const std::vector<std::string>& command) {
++  std::vector<char*> argv;
++  argv.reserve(command.size() + 1);
++  for (const auto& arg : command) {
++    argv.push_back(const_cast<char*>(arg.c_str()));
++  }
++  argv.push_back(nullptr);
++  return argv;
++}
++
++std::vector<std::string> BuildEnvironment(std::string_view path,
++                                          std::string_view edge_binary_path = {}) {
++  std::vector<std::string> environment;
++  for (char** item = ::environ; item != nullptr && *item != nullptr; ++item) {
++    const std::string_view entry(*item);
++    if (entry.starts_with("PATH=")) continue;
++    if (!edge_binary_path.empty() && entry.starts_with("EDGE_BINARY_PATH=")) continue;
++    environment.emplace_back(entry);
++  }
++  environment.emplace_back("PATH=" + std::string(path));
++  if (!edge_binary_path.empty()) {
++    environment.emplace_back("EDGE_BINARY_PATH=" + std::string(edge_binary_path));
++  }
++  return environment;
++}
++
++std::vector<char*> BuildEnvp(std::vector<std::string>* environment) {
++  std::vector<char*> envp;
++  envp.reserve(environment->size() + 1);
++  for (auto& entry : *environment) envp.push_back(entry.data());
++  envp.push_back(nullptr);
++  return envp;
++}
++
++std::string_view CurrentPath() {
++  const char* path = std::getenv("PATH");
++  return path == nullptr ? "/bin:/usr/bin" : std::string_view(path);
++}
++#endif
++
+@@ -159,0 +254,36 @@ CommandResult RunCommandCapture(const std::vector<std::string>& command) {
++#if defined(__wasm__)
++  posix_spawn_file_actions_t actions;
++  int spawn_error = posix_spawn_file_actions_init(&actions);
++  const bool actions_initialized = spawn_error == 0;
++  if (spawn_error == 0) {
++    spawn_error = posix_spawn_file_actions_adddup2(&actions, stdout_pipe[1], STDOUT_FILENO);
++  }
++  if (spawn_error == 0) {
++    spawn_error = posix_spawn_file_actions_adddup2(&actions, stderr_pipe[1], STDERR_FILENO);
++  }
++  if (spawn_error == 0) spawn_error = posix_spawn_file_actions_addclose(&actions, stdout_pipe[0]);
++  if (spawn_error == 0) spawn_error = posix_spawn_file_actions_addclose(&actions, stderr_pipe[0]);
++  if (spawn_error == 0) spawn_error = posix_spawn_file_actions_addclose(&actions, exec_error_pipe[0]);
++  if (spawn_error == 0) spawn_error = posix_spawn_file_actions_addclose(&actions, exec_error_pipe[1]);
++
++  std::vector<char*> argv = BuildArgv(command);
++  pid_t child_pid = -1;
++  if (spawn_error == 0) {
++    spawn_error = SpawnWithPath(&child_pid,
++                                argv[0],
++                                &actions,
++                                nullptr,
++                                argv.data(),
++                                ::environ,
++                                CurrentPath());
++  }
++  if (actions_initialized) (void)posix_spawn_file_actions_destroy(&actions);
++  if (spawn_error != 0) {
++    for (int fd : stdout_pipe) close(fd);
++    for (int fd : stderr_pipe) close(fd);
++    for (int fd : exec_error_pipe) close(fd);
++    result.exec_errno = spawn_error;
++    result.stderr_output = std::strerror(spawn_error);
++    return result;
++  }
++#else
+@@ -196,0 +327 @@ CommandResult RunCommandCapture(const std::vector<std::string>& command) {
++#endif
+@@ -259,0 +391,37 @@ int RunCommandPassthrough(const std::vector<std::string>& command, std::string*
++#if defined(__wasm__)
++  std::vector<char*> argv = BuildArgv(command);
++  posix_spawn_file_actions_t actions;
++  int spawn_error = posix_spawn_file_actions_init(&actions);
++  const bool actions_initialized = spawn_error == 0;
++  if (spawn_error == 0) {
++    spawn_error = posix_spawn_file_actions_addclose(&actions, exec_error_pipe[0]);
++  }
++  if (spawn_error == 0) {
++    spawn_error = posix_spawn_file_actions_addclose(&actions, exec_error_pipe[1]);
++  }
++  pid_t child_pid = -1;
++  if (spawn_error == 0) {
++    spawn_error = SpawnWithPath(&child_pid,
++                                argv[0],
++                                &actions,
++                                nullptr,
++                                argv.data(),
++                                ::environ,
++                                CurrentPath());
++  }
++  if (actions_initialized) (void)posix_spawn_file_actions_destroy(&actions);
++  if (spawn_error != 0) {
++    close(exec_error_pipe[0]);
++    close(exec_error_pipe[1]);
++    if (error_out != nullptr) {
++      if (spawn_error == ENOENT) {
++        *error_out = "safe mode requires Wasmer. Install it from " +
++                     std::string(kSafeModeInstallUrl) + ".";
++      } else {
++        *error_out = std::strerror(spawn_error);
++      }
++    }
++    return 1;
++  }
++  close(exec_error_pipe[1]);
++#else
+@@ -287,0 +456 @@ int RunCommandPassthrough(const std::vector<std::string>& command, std::string*
++#endif
+@@ -425,0 +595,39 @@ int EdgeRunCompatCommand(int argc, const char* const* argv, std::string* error_o
++#else
++#if defined(__wasm__)
++  std::vector<std::string> environment = BuildEnvironment(compat_path, edge_binary_path);
++  std::vector<char*> child_envp = BuildEnvp(&environment);
++  std::vector<char*> child_argv;
++  child_argv.reserve(static_cast<size_t>(argc));
++  for (int i = 1; i < argc; ++i) {
++    if (argv[i] != nullptr) child_argv.push_back(const_cast<char*>(argv[i]));
++  }
++  child_argv.push_back(nullptr);
++
++  pid_t child_pid = -1;
++  const int spawn_error = SpawnWithPath(&child_pid,
++                                        child_argv[0],
++                                        nullptr,
++                                        nullptr,
++                                        child_argv.data(),
++                                        child_envp.data(),
++                                        compat_path);
++  if (spawn_error != 0) {
++    if (error_out != nullptr) {
++      *error_out = "spawn failed for compat command: " + std::string(child_argv[0]) +
++                   ": " + std::strerror(spawn_error);
++    }
++    return spawn_error == ENOENT ? 127 : 1;
++  }
++
++  int status = 0;
++  while (waitpid(child_pid, &status, 0) < 0) {
++    if (errno == EINTR) continue;
++    if (error_out != nullptr) {
++      *error_out = "waitpid failed for compat command: " + std::string(std::strerror(errno));
++    }
++    return 1;
++  }
++  if (WIFEXITED(status)) return WEXITSTATUS(status);
++  if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
++  if (error_out != nullptr) *error_out = "compat command ended unexpectedly";
++  return 1;
+@@ -511,0 +720 @@ int EdgeRunCompatCommand(int argc, const char* const* argv, std::string* error_o
++#endif
+diff --git a/src/edge_napi_embedder_hooks.cc b/src/edge_napi_embedder_hooks.cc
+index fd543902..cf51f150 100644
+--- a/src/edge_napi_embedder_hooks.cc
++++ b/src/edge_napi_embedder_hooks.cc
+@@ -13 +13 @@ uint64_t EdgeGetTotalMemory() {
+-#if defined(__wasi__) || defined(__wasm32__)
++#if defined(__wasi__)
+diff --git a/src/edge_os.cc b/src/edge_os.cc
+index efc1ccec..c569ebc3 100644
+--- a/src/edge_os.cc
++++ b/src/edge_os.cc
+@@ -23 +23 @@
+-#if defined(__wasi__) || defined(__wasm32__)
++#if defined(__wasi__)
+diff --git a/src/internal_binding/binding_http2.cc b/src/internal_binding/binding_http2.cc
+index 0088cfd7..b3b25677 100644
+--- a/src/internal_binding/binding_http2.cc
++++ b/src/internal_binding/binding_http2.cc
+@@ -3895 +3895 @@ napi_value SessionCtor(napi_env env, napi_callback_info info) {
+-#if defined(__wasi__) || defined(__wasm32__)
++#if defined(__wasi__)

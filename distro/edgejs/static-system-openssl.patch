@@ -1,0 +1,68 @@
+diff --git a/cmake/EdgeOpenSSL.cmake b/cmake/EdgeOpenSSL.cmake
+index 41c01112..2abe2534 100644
+--- a/cmake/EdgeOpenSSL.cmake
++++ b/cmake/EdgeOpenSSL.cmake
+@@ -66,8 +66,38 @@ function(edge_require_shared_openssl_target target_name display_name)
+   endif()
+ endfunction()
+-
++function(edge_require_static_openssl_target target_name display_name)
++  set(_static FALSE)
++  foreach(_prop
++      IMPORTED_LOCATION
++      IMPORTED_LOCATION_RELEASE
++      IMPORTED_LOCATION_DEBUG
++      IMPORTED_LOCATION_RELWITHDEBINFO
++      IMPORTED_LOCATION_MINSIZEREL
++      IMPORTED_LOCATION_NOCONFIG)
++    get_target_property(_value "${target_name}" "${_prop}")
++    if(_value AND NOT _value MATCHES "-NOTFOUND$" AND _value MATCHES "\\.a$")
++      set(_static TRUE)
++    endif()
++  endforeach()
++  if(NOT _static)
++    message(FATAL_ERROR
++      "${display_name} resolved to a non-static OpenSSL library. "
++      "Static mode requires static/system OpenSSL libraries.")
++  endif()
++endfunction()
++
+ macro(edge_configure_openssl)
+-  if(EDGE_IS_WASIX_TARGET)
++  if(EDGE_SHARED_OPENSSL AND EDGE_STATIC_OPENSSL)
++    message(FATAL_ERROR
++      "EDGE_SHARED_OPENSSL and EDGE_STATIC_OPENSSL are mutually exclusive.")
++  endif()
++
++  if(EDGE_STATIC_OPENSSL)
++    set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)
++    find_package(OpenSSL REQUIRED)
++    edge_require_static_openssl_target(OpenSSL::Crypto "OpenSSL::Crypto")
++    edge_require_static_openssl_target(OpenSSL::SSL "OpenSSL::SSL")
++  elseif(EDGE_IS_WASIX_TARGET)
+     set(EDGE_OPENSSL_WASIX_ROOT
+       "${PROJECT_ROOT}/deps/openssl-wasix"
+       CACHE PATH "Path to wasix-org OpenSSL source/build tree"
+diff --git a/cmake/EdgeOptions.cmake b/cmake/EdgeOptions.cmake
+index 1b2b4dd3..b421d488 100644
+--- a/cmake/EdgeOptions.cmake
++++ b/cmake/EdgeOptions.cmake
+@@ -24,6 +24,10 @@ function(edge_configure_options)
+     "Link against a shared/system OpenSSL instead of the vendored OpenSSL"
+     OFF
+   )
++  option(EDGE_STATIC_OPENSSL
++    "Link against a static/system OpenSSL instead of the vendored OpenSSL"
++    OFF
++  )
+   option(EDGE_QUICKJS_WEBASSEMBLY
+     "Install a QuickJS-only WebAssembly global backed by Wasmer's wasm_c_api"
+     ON
+@@ -103,6 +107,7 @@ function(edge_configure_options)
+   set(EDGE_PREFER_REPO_LOCAL_V8 "${EDGE_PREFER_REPO_LOCAL_V8}" PARENT_SCOPE)
+   set(EDGE_BUILD_NAPI_TESTS "${EDGE_BUILD_NAPI_TESTS}" PARENT_SCOPE)
+   set(EDGE_SHARED_OPENSSL "${EDGE_SHARED_OPENSSL}" PARENT_SCOPE)
++  set(EDGE_STATIC_OPENSSL "${EDGE_STATIC_OPENSSL}" PARENT_SCOPE)
+   set(EDGE_QUICKJS_WEBASSEMBLY "${EDGE_QUICKJS_WEBASSEMBLY}" PARENT_SCOPE)
+   set(EDGE_QUICKJS_WASMER_VERSION "${EDGE_QUICKJS_WASMER_VERSION}" PARENT_SCOPE)
+   set(EDGE_QUICKJS_WASMER_DIST_ROOT "${EDGE_QUICKJS_WASMER_DIST_ROOT}" PARENT_SCOPE)

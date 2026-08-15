@@ -1,4 +1,4 @@
-# compiler-rt builtins, libc++, and libc++abi cross-compiled for wasm.
+# compiler-rt builtins, libunwind, libc++, and libc++abi cross-compiled for wasm.
 {
   pkgs,
   lib,
@@ -36,7 +36,7 @@ let
     "-DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF"
     "-DCMAKE_SKIP_BUILD_RPATH=ON"
     "-DCMAKE_SKIP_INSTALL_RPATH=ON"
-    "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libcxx;libcxxabi"
+    "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libunwind;libcxx;libcxxabi"
     "-DLLVM_DEFAULT_TARGET_TRIPLE=${platform.targetTriple}"
     "-DLLVM_BUILTIN_TARGETS=${platform.targetTriple}"
     "-DLLVM_ENABLE_PER_TARGET_RUNTIME_DIR=ON"
@@ -56,9 +56,16 @@ let
     "-DLIBCXX_ENABLE_SHARED=OFF"
     "-DLIBCXX_HAS_MUSL_LIBC=ON"
     "-DLIBCXX_USE_COMPILER_RT=ON"
+    "-DLIBUNWIND_ENABLE_SHARED=OFF"
+    "-DLIBUNWIND_ENABLE_STATIC=ON"
+    "-DLIBUNWIND_USE_COMPILER_RT=ON"
     "-DLIBCXXABI_ENABLE_SHARED=OFF"
     "-DLIBCXXABI_USE_COMPILER_RT=ON"
-    "-DLIBCXXABI_USE_LLVM_UNWINDER=OFF"
+    "-DLIBCXXABI_USE_LLVM_UNWINDER=ON"
+    "-DLIBCXXABI_ENABLE_STATIC_UNWINDER=ON"
+    # CMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY makes the normal symbol
+    # probe a false positive; wasm musl does not define this glibc extension.
+    "-DLIBCXXABI_HAS_CXA_THREAD_ATEXIT_IMPL=OFF"
   ];
 in
 
@@ -74,6 +81,16 @@ pkgs.stdenvNoCC.mkDerivation {
     pkgs.python3
     llvm-toolchain-unwrapped
   ];
+
+  postPatch = ''
+    # WebAssembly is neither ELF nor Mach-O, but Clang does not accept the
+    # Windows __declspec export spelling unless Microsoft extensions are on.
+    # libunwind already recognizes __wasm__ in its adjacent weak-alias branch.
+    substituteInPlace libunwind/src/config.h \
+      --replace-fail \
+        '!defined(__ELF__) && !defined(__MACH__) && !defined(_AIX)' \
+        '!defined(__ELF__) && !defined(__MACH__) && !defined(_AIX) && !defined(__wasm__)'
+  '';
 
   configurePhase = ''
     runHook preConfigure

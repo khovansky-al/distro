@@ -4,6 +4,7 @@
   basic-init,
   busybox,
   ca-certificates,
+  edgejs,
   image,
   repository,
   vm-test,
@@ -19,6 +20,7 @@ let
         apk-tools
         basic-init
         busybox
+        edgejs
       ];
       files."/init" = {
         source = ../../runner/rootfs-init.sh;
