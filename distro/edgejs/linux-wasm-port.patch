@@ -542,3 +542,15 @@ index 0088cfd7..b3b25677 100644
 @@ -3895 +3895 @@ napi_value SessionCtor(napi_env env, napi_callback_info info) {
 -#if defined(__wasi__) || defined(__wasm32__)
 +#if defined(__wasi__)
+diff --git a/src/webassembly/edge_wasm.cc b/src/webassembly/edge_wasm.cc
+index 19467cfc..060bf589 100644
+--- a/src/webassembly/edge_wasm.cc
++++ b/src/webassembly/edge_wasm.cc
+@@ -114,2 +114,5 @@ struct WasmState {
+-    if (engine != nullptr)
+-      wasm_engine_delete(engine);
++    // The WAMR engine owns a process-global runtime allocator. JavaScript
++    // wrappers can be finalized after this state is destroyed, so deleting
++    // the engine here would make their wasm_*_delete calls reach a dead
++    // allocator. Keep the singleton alive until process exit; the wrappers
++    // then release their copied WAMR objects normally.

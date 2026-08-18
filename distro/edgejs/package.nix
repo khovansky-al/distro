@@ -201,8 +201,9 @@ stdenv.mkDerivation (finalAttrs: {
     #
     # The release suffix must move whenever the build changes without the source
     # revision moving, or apk sees the installed version and declines the
-    # upgrade. -r1 is the NAPI_RS_NATIVE_LIBRARY_PATH default.
-    apk.version = "0.1.0_git20260815-r1";
+    # upgrade. -r2 is the NAPI_RS_NATIVE_LIBRARY_PATH default plus the WAMR
+    # teardown fix.
+    apk.version = "0.1.0_git20260815-r2";
     checks = {
       node-version = vm-test.installedTest {
         name = "edgejs-node-version";
@@ -228,6 +229,16 @@ stdenv.mkDerivation (finalAttrs: {
       webassembly = vm-test.installedTest {
         name = "edgejs-webassembly";
         init = ./webassembly-test.sh;
+        contents = [
+          busybox
+          finalAttrs.finalPackage
+        ];
+      };
+      # WebAssembly wrappers outlive the environment-owned WAMR state during
+      # teardown. This catches frees reaching WAMR after its allocator dies.
+      webassembly-teardown = vm-test.installedTest {
+        name = "edgejs-webassembly-teardown";
+        init = ./webassembly-teardown-test.sh;
         contents = [
           busybox
           finalAttrs.finalPackage
