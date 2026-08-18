@@ -1429,9 +1429,16 @@ void lowland_relay_stop(struct lowland_relay *relay)
 		char wake = 1;
 
 		relay->stopping = true;
-		if (relay->running)
-			(void)write(relay->wake_write, &wake, sizeof(wake));
-		else if (relay->listener >= 0) {
+		if (relay->running) {
+			/* A failed or short wake write means the run loop is
+			 * already unblocked or gone; there is nothing to
+			 * recover, and (void) does not satisfy
+			 * warn_unused_result. */
+			ssize_t woken = write(relay->wake_write, &wake,
+					      sizeof(wake));
+
+			(void)woken;
+		} else if (relay->listener >= 0) {
 			close(relay->listener);
 			relay->listener = -1;
 		}

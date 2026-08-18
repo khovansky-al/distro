@@ -170,6 +170,8 @@ const server = createServer(async (request, response) => {
   else createReadStream(path, { start, end }).pipe(response);
 });
 
-server.listen(0, "127.0.0.1", () => {
+// Port 0 by default, since the suite only needs some free port. The tailnet
+// demo sets PORT so its Tailscale Serve routes survive a restart.
+server.listen(Number(process.env.PORT ?? 0), "127.0.0.1", () => {
   console.log(`Listening on http://127.0.0.1:${server.address().port}`);
 });
