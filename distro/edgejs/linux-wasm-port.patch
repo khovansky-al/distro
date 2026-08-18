@@ -132,6 +132,57 @@ index 43e6b798..a78c4e47 100644
 +#else
 @@ -962,0 +1001 @@ static int uv__spawn_and_init_child(
 +#endif
+diff --git a/deps/uv/src/unix/thread.c b/deps/uv/src/unix/thread.c
+index 34fea364..862c0f3a 100644
+--- a/deps/uv/src/unix/thread.c
++++ b/deps/uv/src/unix/thread.c
+@@ -137,0 +138,21 @@ int uv_thread_detach(uv_thread_t *tid) {
++#if defined(__wasm__)
++/* A WebAssembly function pointer is an index into a typed table, and an
++ * indirect call traps unless the call site's signature matches the callee's
++ * exactly. The union below squelches a warning on architectures where calling
++ * a void-returning function through a void*-returning pointer happens to
++ * work; here it is a guaranteed trap, so wasm gets a real trampoline. */
++struct uv__wasm_thread_arg {
++  void (*entry)(void* arg);
++  void* arg;
++};
++
++
++static void* uv__wasm_thread_entry(void* arg) {
++  struct uv__wasm_thread_arg self = *(struct uv__wasm_thread_arg*) arg;
++  uv__free(arg);
++  self.entry(self.arg);
++  return NULL;
++}
++#endif
++
++
+@@ -148,0 +170 @@ int uv_thread_create_ex(uv_thread_t* tid,
++#if !defined(__wasm__)
+@@ -153,0 +176 @@ int uv_thread_create_ex(uv_thread_t* tid,
++#endif
+@@ -179,0 +203,18 @@ int uv_thread_create_ex(uv_thread_t* tid,
++#if defined(__wasm__)
++  {
++    struct uv__wasm_thread_arg* ctx = uv__malloc(sizeof(*ctx));
++
++    if (ctx == NULL) {
++      if (attr != NULL)
++        pthread_attr_destroy(attr);
++      return UV_ENOMEM;
++    }
++
++    ctx->entry = entry;
++    ctx->arg = arg;
++    err = pthread_create(tid, attr, uv__wasm_thread_entry, ctx);
++
++    if (err)
++      uv__free(ctx);
++  }
++#else
+@@ -181,0 +223 @@ int uv_thread_create_ex(uv_thread_t* tid,
++#endif
 diff --git a/src/edge_cli.cc b/src/edge_cli.cc
 index a86a5d70..8ab5a49f 100644
 --- a/src/edge_cli.cc
@@ -374,6 +425,116 @@ index efc1ccec..c569ebc3 100644
 @@ -23 +23 @@
 -#if defined(__wasi__) || defined(__wasm32__)
 +#if defined(__wasi__)
+diff --git a/src/edge_process.cc b/src/edge_process.cc
+index faf31ce4..93da42af 100644
+--- a/src/edge_process.cc
++++ b/src/edge_process.cc
+@@ -139,0 +140,39 @@ std::string GetGlibcCompilerVersion() {
++// N-API addons compiled into this executable, keyed by the file name that
++// `require` will ask for.
++std::mutex g_linked_addons_mutex;
++std::vector<std::pair<std::string, napi_addon_register_func>> g_linked_addons;
++
++}  // namespace
++
++// Linked addons: N-API modules compiled into the interpreter rather than
++// loaded from a shared object. A platform without dynamic linking -- the
++// wasm32 Linux target is static-only, and wasm has no dlopen -- cannot open a
++// .node file at all, so the addon's code is linked in and registers itself
++// here under the filename that `require` will ask for.
++//
++// Registration happens from a constructor in the linking object, so the table
++// is complete before any JavaScript runs.
++extern "C" void edge_register_linked_addon(const char* name, napi_addon_register_func init) {
++  if (name == nullptr || init == nullptr) return;
++  std::lock_guard<std::mutex> lock(g_linked_addons_mutex);
++  g_linked_addons.emplace_back(name, init);
++}
++
++namespace {
++
++// Addons are requested by absolute path, but linked under the base name the
++// package installs, so compare on the trailing path component.
++bool LinkedAddonMatches(const std::string& registered, const std::string& requested) {
++  if (registered == requested) return true;
++  const size_t slash = requested.find_last_of('/');
++  return slash != std::string::npos && requested.compare(slash + 1, std::string::npos, registered) == 0;
++}
++
++napi_addon_register_func FindLinkedAddon(const std::string& filename) {
++  std::lock_guard<std::mutex> lock(g_linked_addons_mutex);
++  for (const auto& addon : g_linked_addons) {
++    if (LinkedAddonMatches(addon.first, filename)) return addon.second;
++  }
++  return nullptr;
++}
++
+@@ -4408 +4447,6 @@ napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
+-  if (lib == nullptr) {
++  // A linked addon needs no library handle at all, so it short-circuits the
++  // dynamic load. This is the only path that works where the platform has no
++  // dlopen.
++  init = FindLinkedAddon(filename);
++
++  if (init == nullptr && lib == nullptr) {
+@@ -4419 +4463 @@ napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
+-  init = GetNapiInitializerCallback(lib);
++  if (init == nullptr) init = GetNapiInitializerCallback(lib);
+@@ -4984,0 +5029,52 @@ std::string EdgeGetProcessExecPath() {
++namespace {
++
++// A linked addon is reachable only through NAPI_RS_NATIVE_LIBRARY_PATH.
++// napi-rs's generated loaders consult that variable before any platform
++// detection, and detection cannot succeed here: there is no .node file to find
++// and no dlopen to call, because the addon's code is already in this
++// executable. Defaulting the variable to the placeholder the package installs
++// means an addon works from an interactive shell without the caller having to
++// know any of that. An explicit value always wins, and the default reaches
++// child processes through environ like any other variable.
++//
++// The override is global to napi-rs rather than scoped to one addon, so every
++// napi-rs loader in the process resolves to this addon's placeholder. That is
++// acceptable only because no npm-installed native addon can load on this
++// platform in the first place: without this variable such a require fails on
++// platform detection instead, which is a clearer error but equally fatal.
++void ApplyLinkedAddonLibraryPathDefault() {
++  static std::once_flag once;
++  std::call_once(once, [] {
++    const char* existing = std::getenv("NAPI_RS_NATIVE_LIBRARY_PATH");
++    if (existing != nullptr && *existing != '\0') return;
++
++    std::string name;
++    {
++      std::lock_guard<std::mutex> lock(g_linked_addons_mutex);
++      // One linked addon is the supported case; with several there is no single
++      // correct answer, so leave the variable alone rather than guess.
++      if (g_linked_addons.size() != 1) return;
++      name = g_linked_addons.front().first;
++    }
++    if (name.empty()) return;
++
++    const std::string exec_path = EdgeGetProcessExecPath();
++    if (exec_path.empty()) return;
++
++    namespace fs = std::filesystem;
++    // bin/node to ../lib/edge-addons/<name>: the layout the package installs,
++    // so this resolves whether the interpreter runs from / in a guest root
++    // filesystem or from a prefix.
++    const fs::path placeholder =
++        fs::path(exec_path).lexically_normal().parent_path().parent_path() / "lib" /
++        "edge-addons" / name;
++    std::error_code ec;
++    if (!fs::exists(placeholder, ec) || ec) return;
++
++    // Do not overwrite: an empty-but-present value is still the caller's.
++    ::setenv("NAPI_RS_NATIVE_LIBRARY_PATH", placeholder.string().c_str(), 0);
++  });
++}
++
++}  // namespace
++
+@@ -4992,0 +5089 @@ napi_status EdgeInstallProcessObject(napi_env env,
++  ApplyLinkedAddonLibraryPathDefault();
 diff --git a/src/internal_binding/binding_http2.cc b/src/internal_binding/binding_http2.cc
 index 0088cfd7..b3b25677 100644
 --- a/src/internal_binding/binding_http2.cc

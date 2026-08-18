@@ -27,6 +27,7 @@
   lua,
   make,
   ncurses,
+  npm,
   openssl,
   patch,
   python,
@@ -75,6 +76,7 @@ apk.mkRepository {
       lua
       make
       ncurses
+      npm
       openssl
       patch
       python

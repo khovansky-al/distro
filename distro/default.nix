@@ -93,11 +93,20 @@ lib.makeScope (scope: lib.callPackageWith ({ inherit lib pkgs; } // scope)) (
     lua = callPackage ./lua/package.nix { };
     make = callPackage ./make/package.nix { };
     ncurses = callPackage ./ncurses/package.nix { };
+    # ./npm is this repository's own published npm packages; the guest's npm
+    # command line lives in ./npm-cli.
+    npm = callPackage ./npm-cli/package.nix { };
     openssl = callPackage ./openssl/package.nix { };
     patch = callPackage ./patch/package.nix { };
     python = callPackage ./python/package.nix { };
     quickjs = callPackage ./quickjs/package.nix { };
     readline = callPackage ./readline/package.nix { };
+    # vite 8 bundles with rolldown; its Rust binding is linked into the
+    # interpreter because this platform cannot load a .node file.
+    rolldown = callPackage ./rolldown/package.nix { };
+    # The WebAssembly engine behind Edge.js's `WebAssembly` global. An
+    # interpreter, because a wasm guest cannot generate machine code.
+    wamr = callPackage ./wamr/package.nix { };
     rust-smoke = callPackage ./rust-smoke/package.nix { };
     sed = callPackage ./sed/package.nix { };
     sqlite3 = callPackage ./sqlite3/package.nix { };

@@ -1,0 +1,12 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-08-16 16:57:01.587183859 +0900
++++ b/src/lib.rs	2026-08-16 16:57:01.590328383 +0900
+@@ -40,7 +40,7 @@
+ //!
+ //! The available features are described in the [`features`] module.
+ 
+-#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
++#[cfg(all(target_family = "wasm", not(any(target_os = "wasi", target_os = "linux"))))]
+ compile_error!("This wasm target is unsupported by mio. If using Tokio, disable the net feature.");
+ 
+ // macros used internally

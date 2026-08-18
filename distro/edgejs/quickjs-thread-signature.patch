@@ -1,0 +1,44 @@
+--- a/napi/quickjs/deps/quickjs/cutils.h
++++ b/napi/quickjs/deps/quickjs/cutils.h
+@@ -1954,0 +1955,18 @@
++#if defined(__wasm__)
++/* WebAssembly indirect calls check the callee's exact signature, so the
++ * void-returning start routine cannot be called through a void*-returning
++ * function pointer the way the union below assumes. Trampoline instead. */
++struct js_wasm_thread_arg {
++    void (*start)(void *);
++    void *arg;
++};
++
++static inline void *js_wasm_thread_entry(void *p)
++{
++    struct js_wasm_thread_arg self = *(struct js_wasm_thread_arg *)p;
++    free(p);
++    self.start(self.arg);
++    return NULL;
++}
++#endif
++
+@@ -1957,0 +1976 @@
++#if !defined(__wasm__)
+@@ -1961,0 +1981 @@
++#endif
+@@ -1974,0 +1995,16 @@
++#if defined(__wasm__)
++    {
++        /* Cast explicitly: this header is also included from C++. */
++        struct js_wasm_thread_arg *ctx =
++            (struct js_wasm_thread_arg *)malloc(sizeof(*ctx));
++
++        if (!ctx)
++            goto fail;
++        ctx->start = start;
++        ctx->arg = arg;
++        if (pthread_create(thrd, &attr, js_wasm_thread_entry, ctx)) {
++            free(ctx);
++            goto fail;
++        }
++    }
++#else
+@@ -1976,0 +2013 @@
++#endif

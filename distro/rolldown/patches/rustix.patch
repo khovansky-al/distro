@@ -1,0 +1,46 @@
+diff -ruN a/src/backend/libc/c.rs b/src/backend/libc/c.rs
+--- a/src/backend/libc/c.rs	2026-08-16 16:57:01.549632176 +0900
++++ b/src/backend/libc/c.rs	2026-08-16 16:57:01.559114447 +0900
+@@ -506,6 +506,7 @@
+         target_os = "android",
+         target_os = "emscripten",
+         target_env = "gnu",
++        target_arch = "wasm32",
+         all(target_arch = "loongarch64", target_env = "musl")
+     ))
+ ))]
+diff -ruN a/src/backend/libc/fs/types.rs b/src/backend/libc/fs/types.rs
+--- a/src/backend/libc/fs/types.rs	2026-08-16 16:57:01.549949278 +0900
++++ b/src/backend/libc/fs/types.rs	2026-08-16 16:57:01.559406049 +0900
+@@ -67,15 +67,15 @@
+         const RESOLVE_BENEATH = bitcast!(c::AT_RESOLVE_BENEATH);
+ 
+         /// `AT_STATX_SYNC_AS_STAT`
+-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
++        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_arch = "wasm32")))]
+         const STATX_SYNC_AS_STAT = bitcast!(c::AT_STATX_SYNC_AS_STAT);
+ 
+         /// `AT_STATX_FORCE_SYNC`
+-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
++        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_arch = "wasm32")))]
+         const STATX_FORCE_SYNC = bitcast!(c::AT_STATX_FORCE_SYNC);
+ 
+         /// `AT_STATX_DONT_SYNC`
+-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
++        #[cfg(all(target_os = "linux", any(target_env = "gnu", target_arch = "wasm32")))]
+         const STATX_DONT_SYNC = bitcast!(c::AT_STATX_DONT_SYNC);
+ 
+         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+diff -ruN a/src/ioctl/linux.rs b/src/ioctl/linux.rs
+--- a/src/ioctl/linux.rs	2026-08-16 16:57:01.554488012 +0900
++++ b/src/ioctl/linux.rs	2026-08-16 16:57:01.564155585 +0900
+@@ -51,7 +51,8 @@
+     target_arch = "riscv32",
+     target_arch = "riscv64",
+     target_arch = "loongarch64",
+-    target_arch = "csky"
++    target_arch = "csky",
++    target_arch = "wasm32"
+ ))]
+ mod consts {
+     use super::Opcode;

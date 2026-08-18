@@ -230,12 +230,16 @@ let
     {
       cargoLock ? null,
       cargoPathOverrides ? [ ],
+      # Extra arguments for `cargo build`, such as selecting one workspace
+      # member with `-p`.
+      cargoBuildFlags ? [ ],
       ...
     }@args:
     stdenv.mkDerivation (
       removeAttrs args [
         "cargoLock"
         "cargoPathOverrides"
+        "cargoBuildFlags"
       ]
       // {
         nativeBuildInputs = [
@@ -278,7 +282,7 @@ let
             # will exist in the guest at runtime.
             export RUSTFLAGS="''${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=/nix/store=/usr/src/nix"
             export CARGO_BUILD_JOBS=$NIX_BUILD_CORES
-            cargo build --release --offline --target ${targetTriple}
+            cargo build --release --offline --target ${targetTriple} ${lib.escapeShellArgs cargoBuildFlags}
 
             runHook postBuild
           '';

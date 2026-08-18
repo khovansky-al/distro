@@ -1,0 +1,44 @@
+diff --git a/napi/quickjs/src/js_native_api_quickjs.cc b/napi/quickjs/src/js_native_api_quickjs.cc
+index cbd1f48..dc09195 100644
+--- a/napi/quickjs/src/js_native_api_quickjs.cc
++++ b/napi/quickjs/src/js_native_api_quickjs.cc
+@@ -9,6 +9,7 @@
+ #include <cmath>
+ #include <cstdio>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <string>
+@@ -3073,6 +3074,31 @@ extern "C"
+     return napi_ok;
+   }
+ 
++  // Unlike napi_fatal_exception above, this one does not return: an addon calls
++  // it when it has decided its own state is unrecoverable, and every N-API
++  // implementation ends the process rather than let JavaScript continue against
++  // it. A length of NAPI_AUTO_LENGTH means the string is NUL-terminated.
++  //
++  // [[noreturn]] rather than node_api.h's NAPI_NO_RETURN: this translation unit
++  // includes only js_native_api.h, as the neighbouring node_api definitions
++  // here already do.
++  [[noreturn]] void NAPI_CDECL napi_fatal_error(const char *location,
++                                                size_t location_len,
++                                                const char *message,
++                                                size_t message_len)
++  {
++    auto text = [](const char *value, size_t length) {
++      if (value == nullptr)
++        return std::string();
++      return std::string(value, length == NAPI_AUTO_LENGTH ? strlen(value) : length);
++    };
++
++    fprintf(stderr, "FATAL ERROR: %s %s\n", text(location, location_len).c_str(),
++            text(message, message_len).c_str());
++    fflush(stderr);
++    abort();
++  }
++
+   napi_status NAPI_CDECL napi_create_error(napi_env env, napi_value code, napi_value msg, napi_value *result)
+   {
+     return napi_util__::create_plain_error_common(env, code, msg, result);
