@@ -73,6 +73,10 @@ pkgs.stdenvNoCC.mkDerivation {
     mkdir -p $out
 
     make defconfig ${lib.optionalString debug "debug.config"}
+    # The archive's /usr/bin/env shebang is unavailable in the sandbox.
+    ${pkgs.bash}/bin/bash ./scripts/config -e CONFIG_INOTIFY_USER
+    make olddefconfig
+    grep -q '^CONFIG_INOTIFY_USER=y$' .config
 
     make vmlinux.wasm
 

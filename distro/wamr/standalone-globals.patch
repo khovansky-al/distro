@@ -1,0 +1,25 @@
+diff --git a/core/iwasm/common/wasm_c_api.c b/core/iwasm/common/wasm_c_api.c
+--- a/core/iwasm/common/wasm_c_api.c
++++ b/core/iwasm/common/wasm_c_api.c
+@@ -3707,3 +3707,10 @@ wasm_global_set(wasm_global_t *global, const wasm_val_t *v)
+-    if (!global || !v || !global->inst_comm_rt) {
++    if (!global || !v) {
+         return;
+     }
++
++    /* Host-created globals have no runtime instance. Their value is the
++       initial value retained by wasm_global_new. */
++    if (!global->inst_comm_rt) {
++        wasm_val_copy(global->init, v);
++        return;
++    }
+@@ -3744,3 +3751,9 @@ wasm_global_get(const wasm_global_t *global, wasm_val_t *out)
+     if (!global->inst_comm_rt) {
++        /* wasm_global_new creates a standalone host global. It owns its
++           current value in init, whereas instance-backed globals read from
++           the interpreter/AOT instance below. */
++        if (global->init) {
++            wasm_val_copy(out, global->init);
++        }
+         return;
+     }

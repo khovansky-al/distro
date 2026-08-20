@@ -57,7 +57,19 @@ async function main() {
     throw new Error(`module exports ${JSON.stringify(names)}`);
   }
 
-  console.log(`webassembly ok add(2,3)=${sum}`);
+  // The dev-server path reads a wasm global while transforming a module. WAMR's
+  // wasm_val_delete frees an owned wasm_val_t allocation, so Edge must never
+  // call it on the stack-backed value filled by wasm_global_get or global_set.
+  const global = new WebAssembly.Global({ value: "i32", mutable: true }, 7);
+  if (global.value !== 7) {
+    throw new Error(`initial global value was ${JSON.stringify(global.value)}`);
+  }
+  global.value = 11;
+  if (global.value !== 11) {
+    throw new Error(`updated global value was ${JSON.stringify(global.value)}`);
+  }
+
+  console.log(`webassembly ok add(2,3)=${sum} global=${global.value}`);
 }
 
 main().catch((error) => {
@@ -70,7 +82,7 @@ node /tmp/webassembly.js >/tmp/webassembly.out 2>/tmp/webassembly.err ||
   fail "running a WebAssembly module failed: $(cat /tmp/webassembly.err)"
 
 result="$(cat /tmp/webassembly.out)"
-[ "$result" = "webassembly ok add(2,3)=5" ] ||
+[ "$result" = "webassembly ok add(2,3)=5 global=11" ] ||
   fail "unexpected WebAssembly output '$result'"
 
 echo "::vm-test::pass"

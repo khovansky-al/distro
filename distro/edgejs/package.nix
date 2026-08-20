@@ -201,9 +201,9 @@ stdenv.mkDerivation (finalAttrs: {
     #
     # The release suffix must move whenever the build changes without the source
     # revision moving, or apk sees the installed version and declines the
-    # upgrade. -r2 is the NAPI_RS_NATIVE_LIBRARY_PATH default plus the WAMR
-    # teardown fix.
-    apk.version = "0.1.0_git20260815-r2";
+    # upgrade. -r3 adds the standalone WAMR global fix used by Vite's
+    # WebAssembly-based dependency processing.
+    apk.version = "0.1.0_git20260815-r3";
     checks = {
       node-version = vm-test.installedTest {
         name = "edgejs-node-version";

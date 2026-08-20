@@ -28,7 +28,7 @@ stdenv.mkDerivation (finalAttrs: {
     pkgs.ninja
   ];
 
-  # Two things WAMR's POSIX layer assumes and this platform does not have.
+  # The POSIX layer assumes two things this platform does not have.
   #
   # mmap: absent entirely, since musl's port compiles it out under
   # `#ifndef __wasm__`. Everything os_mmap is asked for is ordinary anonymous
@@ -38,7 +38,13 @@ stdenv.mkDerivation (finalAttrs: {
   # pthread_getattr_np where the thread's stack is, which segfaults here. A
   # WebAssembly stack is not in linear memory and has no address to compare
   # against, and every caller already handles not knowing.
-  patches = [ ./platform-gaps.patch ];
+  # WAMR 2.4.4 also fails to read or write a standalone wasm_global_new global:
+  # it only consults globals belonging to a module instance. Edge.js creates
+  # those host globals for WebAssembly.Global, so retain their value in init.
+  patches = [
+    ./platform-gaps.patch
+    ./standalone-globals.patch
+  ];
 
   # The project file lives here rather than in WAMR's tree: WAMR expects each
   # consumer to select its own feature set and link the sources itself, which

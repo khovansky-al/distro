@@ -78,6 +78,35 @@ int main(void) {
 		return 1;
 	}
 
-	printf("wamr ok add(2,3)=%d\n", results[0].of.i32);
+	/* A host-created global is not backed by an instantiated module. The C API
+	 * must still preserve its initial value and subsequent writes. This is the
+	 * path WebAssembly.Global in Edge.js takes. */
+	wasm_valtype_t *content = wasm_valtype_new(WASM_I32);
+	wasm_globaltype_t *global_type = wasm_globaltype_new(content, WASM_VAR);
+	wasm_val_t initial = WASM_I32_VAL(7);
+	wasm_global_t *global = wasm_global_new(store, global_type, &initial);
+	wasm_globaltype_delete(global_type);
+	if (global == NULL) {
+		printf("wamr: global did not create\n");
+		return 1;
+	}
+
+	wasm_val_t value = WASM_INIT_VAL;
+	wasm_global_get(global, &value);
+	if (value.kind != WASM_I32 || value.of.i32 != 7) {
+		printf("wamr: initial global value was %d\n", value.of.i32);
+		return 1;
+	}
+	wasm_val_t changed = WASM_I32_VAL(11);
+	wasm_global_set(global, &changed);
+	wasm_global_get(global, &value);
+	if (value.kind != WASM_I32 || value.of.i32 != 11) {
+		printf("wamr: updated global value was %d\n", value.of.i32);
+		return 1;
+	}
+	wasm_global_delete(global);
+
+	printf("wamr ok add(2,3)=%d global=%d\n", results[0].of.i32,
+	       value.of.i32);
 	return 0;
 }
