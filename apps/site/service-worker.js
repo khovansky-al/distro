@@ -36,6 +36,10 @@ async function bootFile(pathname) {
 }
 
 async function liveRequest(event, url) {
+  // A recovery page starts with live=1. Its navigation back to the installed
+  // system still carries that old client URL in the fetch event, so an
+  // explicit installed marker must win over the client-derived mode.
+  if (url.searchParams.get("installed") === "1") return false;
   if (url.searchParams.get("live") === "1" || url.searchParams.get("embed") === "1") {
     return true;
   }
@@ -44,6 +48,19 @@ async function liveRequest(event, url) {
   if (client === undefined) return false;
   const parameters = new URL(client.url).searchParams;
   return parameters.get("live") === "1" || parameters.get("embed") === "1";
+}
+
+async function legacyInstallation() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const file = await (await root.getFileHandle("root.ext4")).getFile();
+    if (file.size === 0 || file.size > 64 * 1024 * 1024) return false;
+    const magic = new Uint8Array(await file.slice(1024 + 56, 1024 + 58).arrayBuffer());
+    return magic[0] === 0x53 && magic[1] === 0xef;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NotFoundError") return false;
+    throw error;
+  }
 }
 
 async function serve(event) {
@@ -56,6 +73,12 @@ async function serve(event) {
     (await liveRequest(event, url))
   ) {
     return fetch(request);
+  }
+
+  if (request.mode === "navigate" && (await legacyInstallation())) {
+    const recovery = new URL(url);
+    recovery.searchParams.set("live", "1");
+    return Response.redirect(recovery);
   }
 
   try {

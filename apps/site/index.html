@@ -29,9 +29,42 @@
           user-select: none;
         }
       }
+      #provisioning {
+        margin: 1rem;
+        padding: 1rem;
+        border: 1px solid currentColor;
+        border-radius: 0.5rem;
+        max-width: 42rem;
+      }
+      #provisioning[hidden] {
+        display: none;
+      }
+      #provisioning label,
+      #provisioning button {
+        font: inherit;
+      }
+      #storage-status[data-warning="true"] {
+        color: #b45309;
+      }
     </style>
   </head>
   <body>
+    <section id="provisioning" hidden>
+      <h1>Persistent Linux storage</h1>
+      <p id="provisioning-message"></p>
+      <p>
+        <label>
+          Disk size
+          <select id="disk-size">
+            <option value="4">4 GiB</option>
+            <option value="8">8 GiB</option>
+            <option value="16">16 GiB</option>
+          </select>
+        </label>
+      </p>
+      <button id="provision-disk" type="button">Create persistent disk</button>
+      <p id="provisioning-capacity"></p>
+    </section>
     <details open>
       <summary>info & options</summary>
 
@@ -41,6 +74,7 @@
         There's no x86_64/RISC-V emulation going on here, instead this is a port of the kernel to
         WebAssembly.
       </p>
+      <p id="storage-status"></p>
 
       <p>
         We've got a patched version of the Linux kernel running, complete with virtio devices,
@@ -117,22 +151,27 @@
         consoleDevice,
         entropyDevice,
         fileSystemDevice,
-        workerDevice,
       } from "@lowland/kernel";
-      import { BrowserFS } from "@lowland/guest/browser";
+      import { BrowserFS, openOPFSBlockStorage } from "@lowland/guest/browser";
       import { serveGuest } from "./static/__ASSET_DIRECTORY__/bridge-client.js";
 
       const searchParameters = new URLSearchParams(location.search);
       const parameters = Object.fromEntries(searchParameters);
       const embedded = parameters.embed === "1";
+      const GiB = 1024 ** 3;
+      const legacyDiskBytes = 64 * 1024 * 1024;
+      const requestedDiskGiB =
+        parameters.diskGiB === undefined ? undefined : Number(parameters.diskGiB);
+      if (requestedDiskGiB !== undefined && ![4, 8, 16].includes(requestedDiskGiB)) {
+        throw new Error("diskGiB must be 4, 8, or 16");
+      }
       emitHostEvent("boot-status", { status: "starting" });
 
       // Firefox cannot currently run service workers in the COOP+COEP process
       // used by our module workers, and controlling those workers prevents them
       // from starting. Keep Firefox live-only until Mozilla fixes bug 1613912.
       // https://bugzilla.mozilla.org/show_bug.cgi?id=1613912
-      const persistentInstallSupported =
-        !embedded && !navigator.userAgent.includes("Firefox/");
+      const persistentInstallSupported = !embedded && !navigator.userAgent.includes("Firefox/");
       let bootMode = persistentInstallSupported ? "__BOOT_MODE__" : "live";
       if (!embedded && "serviceWorker" in navigator) {
         if (!persistentInstallSupported) {
@@ -160,6 +199,155 @@
         throw new Error("TCP publication requires a relay query parameter");
       }
 
+      async function inspectPersistentDisk() {
+        const directory = await navigator.storage.getDirectory();
+        const handle = await directory.getFileHandle("root.ext4", { create: true });
+        const file = await handle.getFile();
+        const magic = new Uint8Array(await file.slice(1024 + 56, 1024 + 58).arrayBuffer());
+        return {
+          directory,
+          handle,
+          file,
+          hasFilesystem: magic[0] === 0x53 && magic[1] === 0xef,
+        };
+      }
+
+      async function recommendedDiskGiB() {
+        const estimate = await navigator.storage.estimate();
+        const available = Math.max(0, (estimate.quota ?? 0) - (estimate.usage ?? 0));
+        const requested = requestedDiskGiB;
+        if (requested !== undefined) {
+          if (available < (requested + 1) * GiB) {
+            throw new Error(
+              `Cannot provision a ${requested} GiB disk: browser storage has only ${(available / GiB).toFixed(1)} GiB available; ${requested + 1} GiB is required.`,
+            );
+          }
+          return { available, diskGiB: requested };
+        }
+        if (available >= 9 * GiB) return { available, diskGiB: 8 };
+        if (available >= 5 * GiB) return { available, diskGiB: 4 };
+        throw new Error(
+          `Cannot provision Linux storage: browser storage has only ${(available / GiB).toFixed(1)} GiB available; at least 5 GiB is required for a 4 GiB disk.`,
+        );
+      }
+
+      function showStoragePersistence(persistent) {
+        const status = document.querySelector("#storage-status");
+        status.textContent = persistent
+          ? "Browser storage is marked persistent."
+          : "Warning: storage remains best-effort and WebKit may evict it under storage pressure.";
+        status.dataset.warning = String(!persistent);
+      }
+
+      if (!embedded) {
+        const persistent = navigator.storage.persisted
+          ? await navigator.storage.persisted().catch(() => false)
+          : false;
+        showStoragePersistence(persistent);
+        emitHostEvent("storage-status", { persistent });
+      }
+
+      async function askToProvision({ growing }) {
+        const recommendation = await recommendedDiskGiB();
+        const panel = document.querySelector("#provisioning");
+        const select = document.querySelector("#disk-size");
+        const button = document.querySelector("#provision-disk");
+        select.value = String(recommendation.diskGiB);
+        document.querySelector("#provisioning-message").textContent = growing
+          ? "This 64 MiB installation must be backed up and grown before it can boot."
+          : "Choose the OPFS disk that will hold the writable Linux filesystem across reloads.";
+        document.querySelector("#provisioning-capacity").textContent =
+          `Browser-reported storage available: ${(recommendation.available / GiB).toFixed(1)} GiB.`;
+        button.textContent = growing ? "Back up and grow disk" : "Create persistent disk";
+        panel.hidden = false;
+        emitHostEvent("boot-status", {
+          status: growing ? "awaiting-disk-growth" : "awaiting-storage",
+        });
+
+        return await new Promise((resolve) => {
+          const provision = async () => {
+            button.disabled = true;
+            try {
+              const diskGiB = Number(select.value);
+              // Start the persistence request before any other await so it
+              // remains directly associated with this user gesture.
+              const persistenceRequest = navigator.storage.persist
+                ? navigator.storage.persist()
+                : Promise.resolve(false);
+              const estimate = await navigator.storage.estimate();
+              const available = Math.max(0, (estimate.quota ?? 0) - (estimate.usage ?? 0));
+              if (available < (diskGiB + 1) * GiB) {
+                throw new Error(
+                  `Cannot provision a ${diskGiB} GiB disk: ${(available / GiB).toFixed(1)} GiB is available and ${diskGiB + 1} GiB is required.`,
+                );
+              }
+              const persistent = await persistenceRequest;
+              showStoragePersistence(persistent);
+              emitHostEvent("storage-status", { persistent, diskGiB });
+              panel.hidden = true;
+              button.removeEventListener("click", provision);
+              resolve({ diskGiB, persistent });
+            } catch (error) {
+              button.disabled = false;
+              document.querySelector("#provisioning-capacity").textContent = `${error}`;
+            }
+          };
+          button.addEventListener("click", provision);
+        });
+      }
+
+      async function streamLegacyBackup(state) {
+        let backup;
+        try {
+          backup = await state.directory.getFileHandle("root.ext4.pre-grow");
+        } catch (error) {
+          if (!(error instanceof DOMException) || error.name !== "NotFoundError") throw error;
+        }
+        if (backup) {
+          const existing = await backup.getFile();
+          if (existing.size === state.file.size) return;
+          throw new Error(
+            "root.ext4.pre-grow exists with an unexpected size; refusing to overwrite it",
+          );
+        }
+        backup = await state.directory.getFileHandle("root.ext4.pre-grow", { create: true });
+        const destination = await backup.createWritable();
+        try {
+          await state.file.stream().pipeTo(destination);
+        } catch (error) {
+          await destination.abort(error).catch(() => {});
+          throw error;
+        }
+      }
+
+      let persistentDisk;
+      if (!embedded && persistentInstallSupported) {
+        try {
+          persistentDisk = await inspectPersistentDisk();
+        } catch (error) {
+          console.warn("Persistent storage is unavailable; continuing in live-only mode", error);
+          bootMode = "live";
+        }
+      }
+      const legacyInstallation =
+        persistentDisk?.hasFilesystem && persistentDisk.file.size <= legacyDiskBytes;
+      if (bootMode === "installed" && legacyInstallation) {
+        const recovery = new URL(location.href);
+        recovery.searchParams.set("live", "1");
+        location.replace(recovery);
+        await new Promise(() => {});
+      }
+      let provisioning;
+      if (
+        !embedded &&
+        bootMode === "live" &&
+        persistentDisk &&
+        (persistentDisk.file.size === 0 || legacyInstallation)
+      ) {
+        provisioning = await askToProvision({ growing: legacyInstallation });
+        if (legacyInstallation) await streamLegacyBackup(persistentDisk);
+      }
+
       const term = new Terminal({
         convertEol: true,
         fontFamily: "monospace",
@@ -181,15 +369,7 @@
         term.write("Error: not cross origin isolated\n");
       }
 
-      let opfs;
-      if (!embedded) {
-        try {
-          opfs = await navigator.storage.getDirectory();
-        } catch (error) {
-          console.warn("Persistent storage is unavailable; continuing in live-only mode", error);
-          bootMode = "live";
-        }
-      }
+      const opfs = persistentDisk?.directory;
 
       const { cmdline = "" } = parameters;
 
@@ -300,37 +480,19 @@
         };
       }
 
-      async function openInstallDisk({ directory, requireFilesystem }) {
-        const handle = await directory.getFileHandle("root.ext4", { create: true });
-        const file = await handle.getFile();
-        const superblock = 1024;
-        const magicOffset = superblock + 56;
-        const magic = new Uint8Array(await file.slice(magicOffset, magicOffset + 2).arrayBuffer());
-        const hasFilesystem =
-          file.size >= magicOffset + 2 && magic[0] === 0x53 && magic[1] === 0xef;
-        if (requireFilesystem && !hasFilesystem) {
+      async function openInstallDisk({ requireFilesystem }) {
+        const state = persistentDisk ?? (await inspectPersistentDisk());
+        if (requireFilesystem && !state.hasFilesystem) {
           throw new Error("persistent disk is not a valid ext4 image");
         }
-        if (!requireFilesystem && hasFilesystem) return undefined;
-
-        const worker = new Worker("./static/__ASSET_DIRECTORY__/opfs-disk-worker.js", {
-          type: "module",
+        if (!requireFilesystem && state.hasFilesystem && !legacyInstallation) return undefined;
+        const capacity = provisioning ? provisioning.diskGiB * GiB : undefined;
+        return await openOPFSBlockStorage({
+          directory: state.directory,
+          name: "root.ext4",
+          capacity,
+          resize: legacyInstallation,
         });
-        const devicePromise = workerDevice(worker);
-        worker.postMessage({
-          handle,
-          // The host supplies capacity for a new physical disk; the guest
-          // installer remains solely responsible for its filesystem contents.
-          capacity: file.size === 0 ? 64 * 1024 * 1024 : undefined,
-        });
-        try {
-          const device = await devicePromise;
-          void device.closed.finally(() => worker.terminate()).catch(() => {});
-          return device;
-        } catch (error) {
-          worker.terminate();
-          throw error;
-        }
       }
 
       // Without a raw relay, the host adapter upgrades the guest's plaintext
@@ -347,14 +509,20 @@
       const liveRoot = embedded || bootMode === "live";
       const disk = liveRoot
         ? await openLiveDisk()
-        : await openInstallDisk({ directory: opfs, requireFilesystem: true });
-      // A ?live=1 recovery boot alongside an existing installation must not
-      // expose two LOWLAND_ROOT disks to the general-purpose agent. Only an
-      // unformatted device is attached to a live installer.
+        : await openInstallDisk({ requireFilesystem: true });
+      // A normal recovery boot omits an already formatted installation. Legacy
+      // growth attaches it deliberately and tells the agent to prefer EROFS as
+      // the temporary root, leaving ext4 unmounted for e2fsck and resize2fs.
       const installDisk =
         !embedded && bootMode === "live" && persistentInstallSupported && opfs
-          ? await openInstallDisk({ directory: opfs, requireFilesystem: false })
+          ? await openInstallDisk({ requireFilesystem: false })
           : undefined;
+      emitHostEvent("disk-status", {
+        mode: liveRoot ? "live" : "installed",
+        rootCapacity: disk.capacity,
+        installCapacity: installDisk?.capacity,
+        provisioningDiskGiB: provisioning?.diskGiB,
+      });
       const bootDirectory = opfs
         ? await opfs.getDirectoryHandle("boot", { create: true })
         : undefined;
@@ -364,16 +532,17 @@
       const args = [];
       if (liveRoot) args.push("lowland.root.overlay=tmpfs");
       if (installDisk) args.push("lowland.install=1");
+      if (legacyInstallation) args.push("lowland.root.prefer=erofs");
       const extraArgs = cmdline.replace(/\+/g, " ");
       if (extraArgs) args.push(extraArgs);
 
       const plugins = [guest, ttyConsole];
-      if (installDisk) plugins.push(installDisk);
+      if (installDisk) plugins.push(blockDevice(installDisk));
       plugins.push(entropyDevice());
       if (bootDirectory) {
         plugins.push(fileSystemDevice(new BrowserFS(bootDirectory), { tag: "boot", cache: false }));
       }
-      plugins.push(liveRoot ? blockDevice(disk) : disk);
+      plugins.push(blockDevice(disk));
       plugins.push(networkAttachment);
 
       const machine = await bootMachine({
@@ -385,6 +554,41 @@
       });
       void machine.bootConsole.pipeTo(bootOut).catch(() => {});
       emitHostEvent("boot-status", { status: "guest-started" });
+      if (legacyInstallation) {
+        term.write("\r\nChecking and growing the persistent ext4 filesystem...\r\n");
+        const check = await guest.exec(["/sbin/e2fsck", "-f", "-y", "/dev/vdb"]);
+        const [checkStatus, checkOut, checkError] = await Promise.all([
+          check.status,
+          new Response(check.stdout).text(),
+          new Response(check.stderr).text(),
+        ]);
+        term.write(`${checkOut}${checkError}`.replaceAll("\n", "\r\n"));
+        if (![0, 1].includes(checkStatus.code)) {
+          throw new Error(
+            `e2fsck failed with status ${checkStatus.code}; the pre-grow backup was retained`,
+          );
+        }
+        const resize = await guest.exec(["/sbin/resize2fs", "/dev/vdb"]);
+        const [resizeStatus, resizeOut, resizeError] = await Promise.all([
+          resize.status,
+          new Response(resize.stdout).text(),
+          new Response(resize.stderr).text(),
+        ]);
+        term.write(`${resizeOut}${resizeError}`.replaceAll("\n", "\r\n"));
+        if (!resizeStatus.success) {
+          throw new Error(
+            `resize2fs failed with status ${resizeStatus.code}; the pre-grow backup was retained`,
+          );
+        }
+        term.write("\r\nGrowth complete; rebooting from the persistent disk.\r\n");
+        machine.close();
+        await machine.closed;
+        const installed = new URL(location.href);
+        installed.searchParams.delete("live");
+        installed.searchParams.set("installed", "1");
+        location.replace(installed);
+        await new Promise(() => {});
+      }
       const publications = [];
       try {
         for (const mapping of publicationMappings) {
@@ -415,6 +619,7 @@
         "pagehide",
         () => {
           for (const publication of publications) publication.close();
+          machine.close();
         },
         { once: true },
       );
@@ -431,6 +636,12 @@
         });
       }
       emitHostEvent("boot-status", { status: "ready" });
+      if (!liveRoot) {
+        const root = await navigator.storage.getDirectory();
+        await root.removeEntry("root.ext4.pre-grow").catch((error) => {
+          if (!(error instanceof DOMException) || error.name !== "NotFoundError") throw error;
+        });
+      }
     </script>
   </body>
 </html>

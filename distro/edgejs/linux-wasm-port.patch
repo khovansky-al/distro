@@ -411,6 +411,14 @@ index 022cff91..1eca7f1a 100644
 +  return 1;
 @@ -511,0 +720 @@ int EdgeRunCompatCommand(int argc, const char* const* argv, std::string* error_o
 +#endif
+diff --git a/src/edge_module_loader.cc b/src/edge_module_loader.cc
+index 84dd400d..9b1625a0 100644
+--- a/src/edge_module_loader.cc
++++ b/src/edge_module_loader.cc
+@@ -2577,0 +2578,3 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
++      // Workers validate explicit execArgv through this set even when the
++      // source-tree CLI documentation is not installed beside the runtime.
++      "--unhandled-rejections",
 diff --git a/src/edge_napi_embedder_hooks.cc b/src/edge_napi_embedder_hooks.cc
 index fd543902..cf51f150 100644
 --- a/src/edge_napi_embedder_hooks.cc
@@ -543,26 +551,148 @@ index 0088cfd7..b3b25677 100644
 -#if defined(__wasi__) || defined(__wasm32__)
 +#if defined(__wasi__)
 diff --git a/src/webassembly/edge_wasm.cc b/src/webassembly/edge_wasm.cc
-index 19467cfc..94de10b8 100644
+index 19467cfc..2c3f5c1a 100644
 --- a/src/webassembly/edge_wasm.cc
 +++ b/src/webassembly/edge_wasm.cc
-@@ -114,2 +114,5 @@ struct WasmState {
+@@ -112 +112 @@ struct WasmState {
+-    if (store != nullptr)
++    if (store != nullptr) {
+@@ -114,2 +114,18 @@ struct WasmState {
 -    if (engine != nullptr)
 -      wasm_engine_delete(engine);
++      store = nullptr;
++    }
++    // WAMR's instance keeps raw pointers to imported C-API callbacks instead
++    // of retaining them. Keep each owning extern vector alive through store
++    // teardown so an exported function remains safe after its JS Instance
++    // wrapper has been collected.
++    for (wasm_extern_vec_t *imports : retained_imports) {
++      if (imports == nullptr)
++        continue;
++      wasm_extern_vec_delete(imports);
++      delete imports;
++    }
++    retained_imports.clear();
 +    // The WAMR engine owns a process-global runtime allocator. JavaScript
 +    // wrappers can be finalized after this state is destroyed, so deleting
 +    // the engine here would make their wasm_*_delete calls reach a dead
 +    // allocator. Keep the singleton alive until process exit; the wrappers
 +    // then release their copied WAMR objects normally.
-@@ -1944 +1947,3 @@ napi_value GlobalConstructor(napi_env env, napi_callback_info info) {
+@@ -155,0 +172 @@ struct WasmState {
++  std::vector<wasm_extern_vec_t *> retained_imports;
+@@ -998,3 +1015,4 @@ napi_value CreateFunctionObject(WasmState *state, const std::string &name,
+-            size_t argc = 32;
+-            napi_value argv[32] = {};
+-            napi_value this_arg = nullptr;
++            // Read the callback binding first, then size argv from the Wasm
++            // signature. Emscripten exports functions with more than 32
++            // parameters, and JavaScript permits omitted trailing arguments.
++            size_t argc = 0;
+@@ -1002 +1020 @@ napi_value CreateFunctionObject(WasmState *state, const std::string &name,
+-            if (!GetCallback(env, info, &argc, argv, &this_arg, &raw))
++            if (!GetCallback(env, info, &argc, nullptr, nullptr, &raw))
+@@ -1023,5 +1041,8 @@ napi_value CreateFunctionObject(WasmState *state, const std::string &name,
+-            if (argc < param_count) {
+-              wasm_functype_delete(type);
+-              napi_throw_type_error(
+-                  env, nullptr, "Too few arguments for WebAssembly function");
+-              return nullptr;
++            std::vector<napi_value> argv(param_count);
++            if (param_count > 0) {
++              size_t argument_capacity = param_count;
++              if (!GetCallback(env, info, &argument_capacity, argv.data(),
++                               nullptr, nullptr)) {
++                wasm_functype_delete(type);
++                return nullptr;
++              }
+@@ -1227 +1247,0 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-                       std::vector<wasm_func_t *> *owned_funcs,
+@@ -1229,2 +1249 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-  if (state == nullptr || import_type == nullptr || owned_funcs == nullptr ||
+-      out == nullptr)
++  if (state == nullptr || import_type == nullptr || out == nullptr)
+@@ -1264 +1282,0 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-      owned_funcs->push_back(func);
+@@ -1265,0 +1284,2 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
++      if (*out == nullptr)
++        wasm_func_delete(func);
+@@ -1312 +1331,0 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-    owned_funcs->push_back(func);
+@@ -1313,0 +1333,2 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
++    if (*out == nullptr)
++      wasm_func_delete(func);
+@@ -1325 +1346 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-    *out = wasm_global_as_extern(global->global);
++    *out = wasm_global_as_extern(wasm_global_copy(global->global));
+@@ -1336 +1357 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-    *out = wasm_table_as_extern(table->table);
++    *out = wasm_table_as_extern(wasm_table_copy(table->table));
+@@ -1348 +1369 @@ bool BuildImportExtern(WasmState *state, napi_value import_object,
+-    *out = wasm_memory_as_extern(memory->memory);
++    *out = wasm_memory_as_extern(wasm_memory_copy(memory->memory));
+@@ -1393 +1413,0 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
+-  std::vector<wasm_func_t *> owned_import_funcs;
+@@ -1397,2 +1417 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
+-                           import_types.data[i], &owned_import_funcs,
+-                           &import_externs[i])) {
++                           import_types.data[i], &import_externs[i])) {
+@@ -1404,2 +1423,2 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
+-    for (wasm_func_t *func : owned_import_funcs)
+-      wasm_func_delete(func);
++    for (wasm_extern_t *ext : import_externs)
++      wasm_extern_delete(ext);
+@@ -1410,3 +1429,17 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
+-  wasm_extern_vec_t imports;
+-  imports.size = import_externs.size();
+-  imports.data = import_externs.empty() ? nullptr : import_externs.data();
++  // Construct this through the provider's vector API. WAMR extends the
++  // standard size/data pair with bookkeeping used by wasm_instance_new; a
++  // hand-built vector therefore looks empty and leaves every JS import
++  // unlinked.
++  auto *imports = new wasm_extern_vec_t{};
++  wasm_extern_vec_new(imports, import_externs.size(), import_externs.data());
++  if (!import_externs.empty() &&
++      (imports->data == nullptr || imports->size != import_externs.size())) {
++    for (wasm_extern_t *ext : import_externs)
++      wasm_extern_delete(ext);
++    wasm_extern_vec_delete(imports);
++    delete imports;
++    wasm_importtype_vec_delete(&import_types);
++    napi_throw_error(env, nullptr,
++                     "Failed to allocate WebAssembly import vector");
++    return nullptr;
++  }
+@@ -1415,3 +1448 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
+-      wasm_instance_new(state->store, module->module, &imports, &trap);
+-  for (wasm_func_t *func : owned_import_funcs)
+-    wasm_func_delete(func);
++      wasm_instance_new(state->store, module->module, imports, &trap);
+@@ -1423,0 +1455,2 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
++      wasm_extern_vec_delete(imports);
++      delete imports;
+@@ -1428,0 +1462,2 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
++    wasm_extern_vec_delete(imports);
++    delete imports;
+@@ -1432,0 +1468,2 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
++    wasm_extern_vec_delete(imports);
++    delete imports;
+@@ -1437,0 +1475,7 @@ napi_value InstanceConstructor(napi_env env, napi_callback_info info) {
++  if (import_externs.empty()) {
++    wasm_extern_vec_delete(imports);
++    delete imports;
++  } else {
++    state->retained_imports.push_back(imports);
++  }
++
+@@ -1944 +1988,3 @@ napi_value GlobalConstructor(napi_env env, napi_callback_info info) {
 -  wasm_val_delete(&initial_value);
 +  // `initial_value` is caller-owned stack storage. In particular, WAMR's
 +  // wasm_val_delete frees the wasm_val_t allocation itself, so it must only be
 +  // used with an allocation returned by the C API, never with this value.
-@@ -1976 +1981,2 @@ napi_value GlobalValueGetter(napi_env env, napi_callback_info info) {
+@@ -1976 +2022,2 @@ napi_value GlobalValueGetter(napi_env env, napi_callback_info info) {
 -  wasm_val_delete(&value);
 +  // wasm_global_get writes into the caller's stack storage; it does not return
 +  // a wasm_val_t allocation for us to delete.
-@@ -2010 +2016 @@ napi_value GlobalValueSetter(napi_env env, napi_callback_info info) {
+@@ -2010 +2057 @@ napi_value GlobalValueSetter(napi_env env, napi_callback_info info) {
 -  wasm_val_delete(&value);
 +  // `value` is stack storage filled by JsToWasmVal, not an owned wasm_val_t.

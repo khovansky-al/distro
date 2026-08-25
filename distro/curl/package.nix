@@ -34,9 +34,9 @@ stdenv.mkDerivation (finalAttrs: {
   # would pull in an unavailable transport or a library we do not ship is
   # turned off explicitly so the cross configure cannot latch onto a stray
   # host copy. Plain HTTP/HTTPS/FILE transfers need no fork; the threaded
-  # resolver is disabled so name lookups stay in-process (numeric addresses
-  # in the VM check resolve without DNS regardless). Guest HTTPS is bridged by
-  # the host Fetch implementation, so the package carries no CA trust store.
+  # resolver is disabled so name lookups stay in-process. The browser's raw TCP
+  # relay carries TLS bytes unchanged, so curl must validate peers against the
+  # conventional CA bundle installed by the ca-certificates APK.
   configureFlags = [
     "--disable-shared"
     "--enable-static"
@@ -60,7 +60,7 @@ stdenv.mkDerivation (finalAttrs: {
     "--without-ngtcp2"
     "--without-libssh2"
     "--without-libssh"
-    "--without-ca-bundle"
+    "--with-ca-bundle=/etc/ssl/certs/ca-certificates.crt"
     "--without-ca-path"
     "--without-ca-embed"
   ];

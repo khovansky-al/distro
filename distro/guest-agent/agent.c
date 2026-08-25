@@ -804,7 +804,8 @@ static enum root_filesystem probe_system_root(const char *device)
 	return root_filesystem_none;
 }
 
-static int find_system_root(struct system_root *root)
+static int find_system_root(struct system_root *root,
+			    enum root_filesystem preferred)
 {
 	int attempt;
 
@@ -825,6 +826,8 @@ static int find_system_root(struct system_root *root)
 			}
 			filesystem = probe_system_root(device);
 			if (filesystem == root_filesystem_none)
+				continue;
+			if (preferred != root_filesystem_none && filesystem != preferred)
 				continue;
 			found.filesystem = filesystem;
 			memcpy(found.device, device, sizeof(found.device));
@@ -899,6 +902,7 @@ static int mount_system_root(const struct system_root *root, bool overlay)
 static int prepare_system_root(void)
 {
 	struct system_root root;
+	enum root_filesystem preferred = root_filesystem_none;
 	bool overlay;
 
 	if (make_directory("/dev", 0755) ||
@@ -911,7 +915,12 @@ static int prepare_system_root(void)
 	    mount_if_needed("sysfs", "/sys", "sysfs"))
 		return -1;
 
-	if (find_system_root(&root)) {
+	if (command_line_option("lowland.root.prefer=erofs"))
+		preferred = root_filesystem_erofs;
+	else if (command_line_option("lowland.root.prefer=ext4"))
+		preferred = root_filesystem_ext4;
+
+	if (find_system_root(&root, preferred)) {
 		if (errno == EEXIST)
 			fprintf(stderr, "linux-guest-agent: multiple filesystems are labeled LOWLAND_ROOT\n");
 		else

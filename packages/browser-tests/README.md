@@ -14,19 +14,23 @@ versions in the error if they differ.
 
 Each engine is an ordinary flake check and runs inside the Nix build sandbox:
 
-```console
-nix build .#checks.x86_64-linux.browser-tests-check-chromium -L
-nix build .#checks.x86_64-linux.browser-tests-check-firefox -L
-nix build .#checks.x86_64-linux.browser-tests-check-webkit -L
+```sh
+system="$(nix --extra-experimental-features nix-command eval --impure --raw --expr builtins.currentSystem)"
+nix build ".#checks.$system.browser-tests-check-chromium" -L
+nix build ".#checks.$system.browser-tests-check-firefox" -L
+nix build ".#checks.$system.browser-tests-check-webkit" -L
 ```
 
 The generic check discovery in `checks.nix` exposes these checks and the
 generic CI build matrix runs them. There is no separate browser-test app or CI
 job.
 
-The suite is a boot smoke test: `guestAgent` + `bootMachine` → `exec uname` → clean
-`machine.closed`, once per engine. It catches SAB/COOP/COEP/worker/
-module-loading regressions that only show up on a real browser engine.
+The suite covers guest boot and lifecycle, browser filesystems, sparse OPFS
+block storage, process stress, remote memory, service workers, outbound relay
+networking, and published guest TCP servers. The focused production Chromium
+suite also creates and remounts an ext4 OPFS root and grows a legacy 64 MiB
+filesystem while preserving a file. It catches SAB/COOP/COEP, worker, storage,
+and module-loading regressions that only show up in a real browser engine.
 
 ## Headless graphics
 

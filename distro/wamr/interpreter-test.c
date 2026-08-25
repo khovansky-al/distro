@@ -20,6 +20,12 @@ static const unsigned char kAddModule[] = {
 	0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
 };
 
+static const unsigned char kMemoryModule[] = {
+	0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, /* magic, version 1 */
+	0x05, 0x04, 0x01, 0x01, 0x01, 0x03,             /* memory 1..3 pages */
+	0x07, 0x0a, 0x01, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
+};
+
 int main(void) {
 	wasm_engine_t *engine = wasm_engine_new();
 	if (engine == NULL) {
@@ -106,7 +112,60 @@ int main(void) {
 	}
 	wasm_global_delete(global);
 
-	printf("wamr ok add(2,3)=%d global=%d\n", results[0].of.i32,
-	       value.of.i32);
+	/* Emscripten grows its heap from JavaScript. The C API used to reject
+	 * host-side growth even though the interpreter has the operation. */
+	wasm_byte_vec_new_uninitialized(&binary, sizeof kMemoryModule);
+	memcpy(binary.data, kMemoryModule, sizeof kMemoryModule);
+	wasm_module_t *memory_module = wasm_module_new(store, &binary);
+	wasm_byte_vec_delete(&binary);
+	if (memory_module == NULL) {
+		printf("wamr: memory module did not compile\n");
+		return 1;
+	}
+	wasm_instance_t *memory_instance =
+		wasm_instance_new(store, memory_module, &imports, NULL);
+	if (memory_instance == NULL) {
+		printf("wamr: memory module did not instantiate\n");
+		return 1;
+	}
+	wasm_extern_vec_t memory_exports;
+	wasm_instance_exports(memory_instance, &memory_exports);
+	wasm_memory_t *memory = memory_exports.size == 1
+		? wasm_extern_as_memory(memory_exports.data[0]) : NULL;
+	if (memory == NULL) {
+		printf("wamr: memory export is missing (exports=%u)\n",
+		       (unsigned)memory_exports.size);
+		return 1;
+	}
+	wasm_memory_pages_t before_pages = wasm_memory_size(memory);
+	size_t before_bytes = wasm_memory_data_size(memory);
+	wasm_memorytype_t *memory_type = wasm_memory_type(memory);
+	const wasm_limits_t *memory_limits = wasm_memorytype_limits(memory_type);
+	unsigned maximum = memory_limits == NULL ? 0 : (unsigned)memory_limits->max;
+	wasm_memorytype_delete(memory_type);
+	if (before_pages != 1 || before_bytes != 65536) {
+		printf("wamr: memory export has wrong initial size "
+		       "(pages=%u bytes=%u max=%u)\n",
+		       (unsigned)before_pages, (unsigned)before_bytes, maximum);
+		return 1;
+	}
+	wasm_memory_data(memory)[0] = 0x5a;
+	bool grew = wasm_memory_grow(memory, 1);
+	wasm_memory_pages_t after_pages = wasm_memory_size(memory);
+	size_t after_bytes = wasm_memory_data_size(memory);
+	unsigned first = after_bytes == 0 ? 0 : wasm_memory_data(memory)[0];
+	unsigned last = after_bytes < 2 * 65536
+		? 0xff : wasm_memory_data(memory)[2 * 65536 - 1];
+	if (!grew || after_pages != 2 || after_bytes != 2 * 65536
+	    || first != 0x5a || last != 0) {
+		printf("wamr: host memory growth failed "
+		       "(grew=%d pages=%u bytes=%u max=%u first=%u last=%u)\n",
+		       grew, (unsigned)after_pages, (unsigned)after_bytes, maximum,
+		       first, last);
+		return 1;
+	}
+
+	printf("wamr ok add(2,3)=%d global=%d memory=%u\n", results[0].of.i32,
+	       value.of.i32, wasm_memory_size(memory));
 	return 0;
 }

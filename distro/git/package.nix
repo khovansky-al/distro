@@ -6,10 +6,10 @@
     hash = "sha256-aTL1jVJ8xz4CMocAzzHaEepLgUO/7OXTb/Ao0GR5AVQ=";
   },
   busybox,
+  ca-certificates,
   zlib,
   curl,
   openssl,
-  ca-certificates,
   vm-test,
 }:
 

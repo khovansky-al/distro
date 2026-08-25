@@ -27,6 +27,13 @@ The first byte is an opcode:
 The relay resolves only IPv4 because the current WASM kernel guest network is
 IPv4-only. CONNECT accepts a hostname or numeric address.
 
+The guest Ethernet gateway address `192.0.2.1` has one special CONNECT
+meaning: the relay opens the socket on its own IPv4 loopback address
+(`127.0.0.1`). This lets a guest reach the site, APK repository, and other
+services packaged alongside a loopback-only relay without exposing those
+services on a LAN interface. RESOLVE is unchanged, and no other destination is
+rewritten.
+
 ## Published TCP listeners
 
 A publication starts with BIND as the first message on a persistent control

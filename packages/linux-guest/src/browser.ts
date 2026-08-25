@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import {
+  type BlockDeviceStorage,
   type FS,
   type FSAttributes,
   type FSCreateContext,
@@ -9,6 +10,318 @@ import {
   type FSSetAttributes,
   type FSTimestamp,
 } from "@lowland/kernel";
+
+export { opfsBlockErrorCode } from "./opfs-block-errors.js";
+
+export class OPFSBlockStorageError extends Error {
+  readonly code: string;
+
+  constructor(message: string, code = "EIO", options?: ErrorOptions) {
+    super(message, options);
+    this.name = "OPFSBlockStorageError";
+    this.code = code;
+  }
+}
+
+export interface OPFSBlockStorage extends BlockDeviceStorage, AsyncDisposable {
+  readonly capacity: number;
+  readonly closed: Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface OpenOPFSBlockStorageOptions {
+  /** OPFS directory containing the disk. Defaults to the origin's root. */
+  directory?: FileSystemDirectoryHandle;
+  /** File name within `directory`. Defaults to `root.ext4`. */
+  name?: string;
+  /** Create the file when it is absent. Defaults to true. */
+  create?: boolean;
+  /** Initialize an empty file to this size, or require this exact existing size. */
+  capacity?: number;
+  /** Grow an existing file to `capacity`; shrinking is never allowed. */
+  resize?: boolean;
+  /** Override the origin-wide exclusive Web Lock name. */
+  lockName?: string;
+}
+
+const OPFS_BLOCK_METADATA_VERSION = 1;
+// Chromium's OPFS synchronous access handle cannot reliably grow one sparse
+// file to 1 GiB in every supported storage backend. Present one logical block
+// device while keeping its implementation files below that boundary.
+const OPFS_BLOCK_SEGMENT_SIZE = 256 * 1024 ** 2;
+
+interface OPFSBlockMetadata {
+  version: number;
+  capacity: number;
+  segmentSize: number;
+}
+
+async function readOPFSBlockMetadata(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+): Promise<OPFSBlockMetadata | undefined> {
+  let handle: FileSystemFileHandle;
+  try {
+    handle = await directory.getFileHandle(`${name}.metadata`);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NotFoundError") return undefined;
+    throw error;
+  }
+  const parsed = JSON.parse(await (await handle.getFile()).text()) as Partial<OPFSBlockMetadata>;
+  if (
+    parsed.version !== OPFS_BLOCK_METADATA_VERSION ||
+    !Number.isSafeInteger(parsed.capacity) ||
+    parsed.capacity! <= 0 ||
+    parsed.segmentSize !== OPFS_BLOCK_SEGMENT_SIZE
+  ) {
+    throw new OPFSBlockStorageError(`OPFS disk ${name} has invalid metadata`, "EIO");
+  }
+  return parsed as OPFSBlockMetadata;
+}
+
+async function writeOPFSBlockMetadata(
+  directory: FileSystemDirectoryHandle,
+  name: string,
+  capacity: number,
+) {
+  const handle = await directory.getFileHandle(`${name}.metadata`, { create: true });
+  const writable = await handle.createWritable();
+  try {
+    await writable.write(
+      JSON.stringify({
+        version: OPFS_BLOCK_METADATA_VERSION,
+        capacity,
+        segmentSize: OPFS_BLOCK_SEGMENT_SIZE,
+      }),
+    );
+    await writable.close();
+  } catch (error) {
+    await writable.abort(error).catch(() => {});
+    throw error;
+  }
+}
+
+interface WorkerResponse {
+  id: number;
+  ok: boolean;
+  capacity?: number;
+  data?: ArrayBuffer;
+  written?: number;
+  error?: { name: string; message: string; code: string };
+}
+
+/**
+ * Opens a random-access OPFS file as virtio block storage.
+ *
+ * A dedicated worker owns the synchronous access handle. Only requested byte
+ * ranges cross the worker boundary, and a Web Lock prevents another tab from
+ * mounting the same origin-private disk at the same time.
+ */
+export async function openOPFSBlockStorage(
+  options: OpenOPFSBlockStorageOptions = {},
+): Promise<OPFSBlockStorage> {
+  if (!navigator.storage?.getDirectory) {
+    throw new OPFSBlockStorageError("this browser does not support OPFS", "ENOSYS");
+  }
+  if (!navigator.locks?.request) {
+    throw new OPFSBlockStorageError("this browser does not support exclusive Web Locks", "ENOSYS");
+  }
+  const directory = options.directory ?? (await navigator.storage.getDirectory());
+  const name = options.name ?? "root.ext4";
+  const file = await directory.getFileHandle(name, { create: options.create ?? true });
+  const parts = await directory.resolve(file);
+  const lockName = options.lockName ?? `@lowland/guest/opfs-block/${parts?.join("/") ?? name}`;
+  const acquired = Promise.withResolvers<boolean>();
+  const releaseLock = Promise.withResolvers<void>();
+  let acquisitionSettled = false;
+  const lockRequest = navigator.locks.request(
+    lockName,
+    { mode: "exclusive", ifAvailable: true },
+    async (lock) => {
+      acquisitionSettled = true;
+      acquired.resolve(lock !== null);
+      if (lock) await releaseLock.promise;
+    },
+  );
+  void lockRequest.catch((error) => {
+    if (!acquisitionSettled) acquired.reject(error);
+  });
+  if (!(await acquired.promise)) {
+    throw new OPFSBlockStorageError(`OPFS disk ${name} is already mounted in another tab`, "EBUSY");
+  }
+
+  let requestedCapacity: number;
+  try {
+    const metadata = await readOPFSBlockMetadata(directory, name);
+    const firstSegmentSize = (await file.getFile()).size;
+    requestedCapacity = metadata?.capacity ?? firstSegmentSize;
+    if (options.capacity !== undefined) {
+      if (!Number.isSafeInteger(options.capacity) || options.capacity <= 0) {
+        throw new RangeError("OPFS disk capacity must be a positive safe integer");
+      }
+      if (
+        requestedCapacity === 0 ||
+        (options.resize === true && requestedCapacity < options.capacity)
+      ) {
+        requestedCapacity = options.capacity;
+      } else if (requestedCapacity !== options.capacity) {
+        throw new RangeError(
+          `existing OPFS disk is ${requestedCapacity} bytes, not the requested ${options.capacity}`,
+        );
+      }
+    }
+    if (requestedCapacity <= 0) {
+      throw new RangeError("an empty OPFS disk requires an explicit capacity");
+    }
+    if (requestedCapacity > OPFS_BLOCK_SEGMENT_SIZE || metadata) {
+      await writeOPFSBlockMetadata(directory, name, requestedCapacity);
+    }
+  } catch (error) {
+    releaseLock.resolve();
+    await lockRequest.catch(() => {});
+    throw error;
+  }
+
+  const worker = new Worker(new URL("./opfs-block-worker.js", import.meta.url), {
+    type: "module",
+    name: `OPFS block storage: ${name}`,
+  });
+  let nextId = 1;
+  let closing = false;
+  let fatalError: OPFSBlockStorageError | undefined;
+  const pending = new Map<
+    number,
+    ReturnType<typeof Promise.withResolvers<Record<string, unknown>>>
+  >();
+  const closed = Promise.withResolvers<void>();
+  void closed.promise.catch(() => {});
+
+  const fail = (error: unknown) => {
+    const failure =
+      error instanceof OPFSBlockStorageError
+        ? error
+        : new OPFSBlockStorageError(error instanceof Error ? error.message : String(error), "EIO", {
+            cause: error,
+          });
+    if (fatalError) return;
+    fatalError = failure;
+    closing = true;
+    for (const operation of pending.values()) operation.reject(failure);
+    pending.clear();
+    worker.terminate();
+    releaseLock.resolve();
+    closed.reject(failure);
+  };
+
+  worker.addEventListener("message", (event: MessageEvent<WorkerResponse>) => {
+    const response = event.data;
+    const operation = pending.get(response.id);
+    if (!operation) return;
+    pending.delete(response.id);
+    if (response.ok) operation.resolve(response as unknown as Record<string, unknown>);
+    else {
+      const detail = response.error;
+      operation.reject(
+        new OPFSBlockStorageError(detail?.message ?? "OPFS block operation failed", detail?.code, {
+          cause: detail,
+        }),
+      );
+    }
+  });
+  worker.addEventListener("error", (event) => fail(event.error ?? new Error(event.message)));
+  worker.addEventListener("messageerror", () => fail(new Error("invalid OPFS worker message")));
+
+  const call = (message: Record<string, unknown>, transfer: Transferable[] = []) => {
+    if (fatalError) return Promise.reject(fatalError);
+    if (closing && message.type !== "close") {
+      return Promise.reject(new OPFSBlockStorageError("OPFS disk is closing", "EBADF"));
+    }
+    const id = nextId++;
+    const operation = Promise.withResolvers<Record<string, unknown>>();
+    pending.set(id, operation);
+    worker.postMessage({ id, ...message }, transfer);
+    return operation.promise;
+  };
+
+  let opened: Record<string, unknown>;
+  try {
+    opened = await call({
+      type: "init",
+      file,
+      directory,
+      name,
+      capacity: requestedCapacity,
+      segmentSize: OPFS_BLOCK_SEGMENT_SIZE,
+    });
+  } catch (error) {
+    fail(error);
+    throw error;
+  }
+  const capacity = opened.capacity;
+  if (typeof capacity !== "number") {
+    const error = new OPFSBlockStorageError("OPFS worker returned no disk capacity");
+    fail(error);
+    throw error;
+  }
+
+  const checkRange = (offset: number, length: number) => {
+    if (
+      !Number.isSafeInteger(offset) ||
+      !Number.isSafeInteger(length) ||
+      offset < 0 ||
+      length < 0 ||
+      offset + length > capacity
+    ) {
+      throw new RangeError("block request is outside the OPFS disk");
+    }
+  };
+
+  const storage: OPFSBlockStorage = {
+    capacity,
+    closed: closed.promise,
+    async read(offset, target) {
+      checkRange(offset, target.byteLength);
+      const response = await call({ type: "read", offset, length: target.byteLength });
+      if (!(response.data instanceof ArrayBuffer)) {
+        throw new OPFSBlockStorageError("OPFS worker returned invalid read data");
+      }
+      const data = new Uint8Array(response.data);
+      target.set(data);
+      return data.byteLength;
+    },
+    async write(offset, data) {
+      checkRange(offset, data.byteLength);
+      const copy = data.slice();
+      const response = await call({ type: "write", offset, data: copy.buffer }, [copy.buffer]);
+      if (typeof response.written !== "number") {
+        throw new OPFSBlockStorageError("OPFS worker returned an invalid write count");
+      }
+      return response.written;
+    },
+    async flush() {
+      await call({ type: "flush" });
+    },
+    async close() {
+      if (closing) return closed.promise;
+      closing = true;
+      try {
+        await call({ type: "close" });
+        worker.terminate();
+        releaseLock.resolve();
+        await lockRequest;
+        closed.resolve();
+      } catch (error) {
+        fail(error);
+        throw error;
+      }
+      return closed.promise;
+    },
+    async [Symbol.asyncDispose]() {
+      await storage.close();
+    },
+  };
+  return storage;
+}
 
 const FileType = {
   directory: 0o040000,

@@ -4,12 +4,25 @@
   basic-init,
   busybox,
   ca-certificates,
+  curl,
+  dropbear,
   edgejs,
+  file,
+  git,
   image,
+  jq,
+  lua,
+  make,
   npm,
+  openssl,
+  pnpm,
   pkgs,
+  python,
+  quickjs,
   repository,
+  sqlite3,
   vm-test,
+  zstd,
 }:
 
 let
@@ -22,7 +35,20 @@ let
         apk-tools
         basic-init
         busybox
+        zstd
+        file
+        jq
+        lua
+        make
         npm
+        pnpm
+        openssl
+        quickjs
+        python
+        sqlite3
+        curl
+        git
+        dropbear
         edgejs
       ];
       files."/init" = {

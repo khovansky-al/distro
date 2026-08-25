@@ -182,6 +182,37 @@ failed rename can leave a partial destination or both names. Use `cache: false`
 for directories modified outside the guest; this disables metadata and name
 caching, but not the guest's data page cache.
 
+## Persistent browser block storage
+
+Use a worker-owned OPFS logical disk when Linux needs a complete persistent
+block device, including ext4 semantics:
+
+```js
+import { blockDevice, bootMachine } from "@lowland/kernel";
+import { guestAgent } from "@lowland/guest";
+import { openOPFSBlockStorage } from "@lowland/guest/browser";
+
+const disk = await openOPFSBlockStorage({
+  name: "root.ext4",
+  capacity: 8 * 1024 ** 3,
+});
+const guest = guestAgent();
+await using machine = await bootMachine({
+  cpus: 1,
+  plugins: [guest, blockDevice(disk)],
+});
+```
+
+The adapter keeps its `FileSystemSyncAccessHandle`s in a dedicated worker and
+copies only requested ranges across the worker boundary. Large logical disks
+are split into bounded OPFS implementation files, but callers and Linux see one
+contiguous block device; the complete disk is never read into a JavaScript
+array. Operations are serialized, flush maps to the access handles, quota
+failures surface as block I/O failures, and an origin-wide exclusive Web Lock
+prevents a second tab from opening the same disk. Closing the machine flushes
+and closes the handles and releases that lock. Pass `resize: true` with a
+larger `capacity` to extend an existing disk; the adapter never shrinks one.
+
 ## License
 
 The TypeScript and JavaScript sources are available under the MIT license. The

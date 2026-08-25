@@ -31,6 +31,8 @@
 #define CAPABILITY_LENGTH 16
 #define MAX_PENDING_CONNECTIONS 64
 #define PENDING_LIFETIME_SECONDS 45
+#define GUEST_GATEWAY_ADDRESS "192.0.2.1"
+#define NATIVE_LOOPBACK_ADDRESS "127.0.0.1"
 
 enum opcode {
 	OP_CONNECT = 0x01,
@@ -623,11 +625,13 @@ static int connect_socket(struct relay_client *client, const char *host,
 {
 	struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
 	struct addrinfo *addresses = NULL, *current;
+	const char *native_host = strcmp(host, GUEST_GATEWAY_ADDRESS) == 0 ?
+		NATIVE_LOOPBACK_ADDRESS : host;
 	char service[6];
 	int fd = -1;
 
 	snprintf(service, sizeof(service), "%u", port);
-	if (getaddrinfo(host, service, &hints, &addresses))
+	if (getaddrinfo(native_host, service, &hints, &addresses))
 		return -1;
 	for (current = addresses; current; current = current->ai_next) {
 		fd = socket(current->ai_family, current->ai_socktype, current->ai_protocol);

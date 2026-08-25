@@ -50,4 +50,9 @@ test("serves an installed boot tree from OPFS and supports live recovery", async
   expect(await page.evaluate(() => fetch("/app.js").then((response) => response.text()))).toContain(
     "guestAgent",
   );
+
+  // Recovery begins from a live=1 client. The explicit installed marker must
+  // override that old client URL for the navigation back to the OPFS boot tree.
+  await page.goto("/?installed=1");
+  await expect(page.locator("body")).toHaveText("local boot");
 });

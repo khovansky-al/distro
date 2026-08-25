@@ -79,6 +79,8 @@ run_case() {
   eval "warnings_${label}=$warnings"
 }
 
+warnings_n1=0
+warnings_n8=0
 run_case n1 1
 run_case n8 8
 

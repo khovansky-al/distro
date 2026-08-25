@@ -15,6 +15,29 @@
 let
   source = ../../packages/browser-tests;
 
+  legacyRoot =
+    pkgs.runCommand "site-legacy-root.ext4"
+      {
+        nativeBuildInputs = [
+          pkgs.e2fsprogs
+          pkgs.fakeroot
+        ];
+      }
+      ''
+        mkdir root
+        cp -a --no-preserve=ownership ${site.rootfs.root}/. root/
+        chmod -R u+w root
+        # Match install-lowland's filesystem skeleton. Empty mountpoints are
+        # not represented by the package payload copied above, but the agent
+        # needs them before it can move dev/proc/sys and mount run/tmp.
+        mkdir -p root/boot root/dev root/mnt root/proc root/run root/sys root/tmp
+        chmod 1777 root/tmp
+        touch root/etc/lowland-installed
+        printf '%s\n' preserved-before-growth > root/growth-marker
+        truncate -s 64M "$out"
+        fakeroot sh -c 'chown -R 0:0 root && exec mke2fs -q -t ext4 -d root -F -L LOWLAND_ROOT -m 0 "$1"' -- "$out"
+      '';
+
   baseSuite = pkgs.runCommand "browser-tests" { } ''
     mkdir -p \
       $out/node_modules/@lowland/bytes \
@@ -35,6 +58,7 @@ let
     cp ${source}/tests/boot.spec.js $out/tests/
     cp ${source}/tests/opfs-disk.spec.js $out/tests/
     cp ${source}/tests/posix-spawn-stress.spec.js $out/tests/
+    cp ${source}/tests/opfs-block.spec.js $out/tests/
     cp ${source}/tests/remote-memory.spec.js $out/tests/
     cp ${source}/tests/spawn-stress.spec.js $out/tests/
     cp ${source}/tests/virtio-fs.spec.js $out/tests/
@@ -76,6 +100,9 @@ let
       cp ${source}/server.js $out/server.js
       cp ${source}/tests/site-live.spec.js $out/tests/site-live.spec.js
       cp -rL ${site.package}/. $out/
+      cp ${legacyRoot} $out/legacy-root.ext4
+      cp -rL ${site.bootFiles}/boot $out/legacy-boot
+      find $out/legacy-boot -type f -printf '%P\n' | LC_ALL=C sort > $out/legacy-boot-manifest.txt
       # Production and previews fetch the independently published repository.
       # The integration test vendors the exact candidate repository so it can
       # validate an install before those packages have reached production.

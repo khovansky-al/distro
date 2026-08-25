@@ -1,0 +1,53 @@
+diff --git a/napi/quickjs/src/js_native_api_quickjs.cc b/napi/quickjs/src/js_native_api_quickjs.cc
+index dc09195..0dc1cb2 100644
+--- a/napi/quickjs/src/js_native_api_quickjs.cc
++++ b/napi/quickjs/src/js_native_api_quickjs.cc
+@@ -378,5 +378,19 @@ extern "C"
+     auto rt = JS_GetRuntime(env->context());
+     auto buf = js_malloc_rt(rt, byte_length);
++    if (buf == nullptr && byte_length > 0)
++    {
++      // ArrayBuffer backing stores account toward QuickJS's heap, but this
++      // allocation happens before the JS object allocation that normally
++      // checks the GC threshold. Retry once after collecting dead buffers and
++      // cycles before reporting a real process OOM.
++      JS_RunGC(rt);
++      buf = js_malloc_rt(rt, byte_length);
++      if (buf == nullptr)
++      {
++        JS_ThrowOutOfMemory(env->context());
++        return napi_pending_exception;
++      }
++    }
+     if (data != nullptr)
+     {
+       *data = buf;
+diff --git a/napi/quickjs/src/unofficial_napi.cc b/napi/quickjs/src/unofficial_napi.cc
+index 3d91449..265fc34 100644
+--- a/napi/quickjs/src/unofficial_napi.cc
++++ b/napi/quickjs/src/unofficial_napi.cc
+@@ -490,20 +490,9 @@ extern "C"
+     {
+         if (!napi_util__::check_env(env) || result == nullptr)
+             return napi_invalid_arg;
+-        if (length == 0)
+-            return napi_create_arraybuffer(env, 0, nullptr, result);
+-
+-        void *data = zero_fill ? std::calloc(length, 1) : std::malloc(length);
+-        if (data == nullptr)
+-            return napi_generic_failure;
+-        napi_status status = napi_create_external_arraybuffer(
+-            env,
+-            data,
+-            length,
+-            [](napi_env, void *bytes, void *) { std::free(bytes); },
+-            nullptr,
+-            result);
+-        if (status != napi_ok)
+-            std::free(data);
++        void *data = nullptr;
++        napi_status status = napi_create_arraybuffer(env, length, &data, result);
++        if (status == napi_ok && zero_fill && length > 0)
++            std::memset(data, 0, length);
+         return status;
+     }

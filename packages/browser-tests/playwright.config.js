@@ -13,7 +13,16 @@ export default defineConfig({
     reuseExistingServer: false,
   },
   projects: [
-    { name: "chromium", use: { browserName: "chromium" } },
+    {
+      name: "chromium",
+      use: {
+        browserName: "chromium",
+        // Nix build sandboxes expose a deliberately tiny default quota. The
+        // tests still exercise real OPFS files; this flag only lets their
+        // disposable profile represent the production 4 GiB sparse disk.
+        launchOptions: { args: ["--unlimited-storage"] },
+      },
+    },
     { name: "firefox", use: { browserName: "firefox" } },
     { name: "webkit", use: { browserName: "webkit" } },
   ],

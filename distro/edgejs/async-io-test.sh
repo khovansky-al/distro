@@ -28,6 +28,18 @@ mount -t proc proc /proc || fail "mounting proc failed"
 cat >/tmp/async-io.js <<'SCRIPT'
 const { randomBytes } = require("node:crypto");
 const { readFile, writeFile } = require("node:fs/promises");
+const { Worker } = require("node:worker_threads");
+
+function workerExecArgv() {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      "require('node:worker_threads').parentPort.postMessage(process.execArgv)",
+      { eval: true, execArgv: ["--unhandled-rejections=strict"] },
+    );
+    worker.once("message", resolve);
+    worker.once("error", reject);
+  });
+}
 
 async function main() {
   await writeFile("/tmp/async-io.data", "threadpool");
@@ -49,6 +61,11 @@ async function main() {
   );
   if (many.length !== 16 || many.some((value) => value !== "threadpool")) {
     throw new Error("concurrent reads disagreed");
+  }
+
+  const execArgv = await workerExecArgv();
+  if (execArgv.length !== 1 || execArgv[0] !== "--unhandled-rejections=strict") {
+    throw new Error(`worker lost execArgv: ${JSON.stringify(execArgv)}`);
   }
 
   console.log("async-io ok");

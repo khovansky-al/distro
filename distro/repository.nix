@@ -28,6 +28,7 @@
   make,
   ncurses,
   npm,
+  pnpm,
   openssl,
   patch,
   python,
@@ -42,6 +43,7 @@
   xz,
   zlib,
   zstd,
+  yarn,
 }:
 
 # The published repository: the set of derivations the runtime package manager
@@ -77,6 +79,7 @@ apk.mkRepository {
       make
       ncurses
       npm
+      pnpm
       openssl
       patch
       python
@@ -91,6 +94,7 @@ apk.mkRepository {
       xz
       zlib
       zstd
+      yarn
       ;
   }
   // lib.optionalAttrs (bootFiles != null) { inherit bootFiles; };

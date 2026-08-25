@@ -6,7 +6,12 @@ import {
   workerDevice,
 } from "@lowland/kernel";
 import { createNetwork, guestAgent, webSocketNetwork } from "@lowland/guest";
-import { BrowserFS } from "@lowland/guest/browser";
+import {
+  BrowserFS,
+  OPFSBlockStorageError,
+  openOPFSBlockStorage,
+  opfsBlockErrorCode,
+} from "@lowland/guest/browser";
 
 async function collectProcess(child) {
   const [status, stdout, stderr] = await Promise.all([
@@ -588,3 +593,64 @@ globalThis.opfsVirtioFileSystemGuest = async () => {
     persistedLast: persisted.at(-1),
   };
 };
+
+globalThis.opfsBlockStorage = async () => {
+  const directory = await navigator.storage.getDirectory();
+  const name = "opfs-block-storage-test.ext4";
+  const removeDisk = async () => {
+    await directory.removeEntry(name).catch(() => {});
+    await directory.removeEntry(`${name}.metadata`).catch(() => {});
+    for (let index = 1; ; index++) {
+      try {
+        await directory.removeEntry(`${name}.part${index}`);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError") break;
+        throw error;
+      }
+    }
+  };
+  await removeDisk();
+  const capacity = 4 * 1024 ** 3;
+  const positions = [0, 137 * 1024 * 1024 + 509, capacity - 4096];
+  const expected = positions.map((position, index) => {
+    const data = new Uint8Array(4096);
+    for (let offset = 0; offset < data.length; offset++) data[offset] = (offset + index * 31) % 251;
+    return { position, data };
+  });
+  const storage = await openOPFSBlockStorage({ directory, name, capacity });
+  let locked;
+  try {
+    await Promise.all(expected.map(({ position, data }) => storage.write(position, data)));
+    await storage.flush();
+    locked = await openOPFSBlockStorage({ directory, name }).then(
+      () => "opened",
+      (error) => (error instanceof OPFSBlockStorageError ? error.code : `${error}`),
+    );
+  } finally {
+    await storage.close();
+  }
+
+  const reopened = await openOPFSBlockStorage({ directory, name });
+  try {
+    const reads = await Promise.all(
+      expected.map(async ({ position, data }) => {
+        const actual = new Uint8Array(data.byteLength);
+        const read = await reopened.read(position, actual);
+        if (read !== actual.byteLength) return false;
+        return actual.every((value, index) => value === data[index]);
+      }),
+    );
+    return {
+      capacity: reopened.capacity,
+      locked,
+      reads,
+      readBytes: expected.reduce((total, entry) => total + entry.data.byteLength, 0),
+    };
+  } finally {
+    await reopened.close();
+    await removeDisk();
+  }
+};
+
+globalThis.opfsBlockQuotaMapping = () =>
+  opfsBlockErrorCode(new DOMException("test quota exhausted", "QuotaExceededError"));

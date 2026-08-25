@@ -92,58 +92,63 @@ export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
 
       let n = 0;
       let offset = Number(request.sector) * 512;
-      switch (request.type) {
-        case BlockDeviceRequestType.IN: {
-          let ok = true;
-          for (const desc of data) {
-            assert(desc.writable, "data must be writable when IN");
-            const read = await storage.read(offset, desc.array);
-            if (read !== desc.array.byteLength) {
-              ok = false;
-              break;
+      try {
+        switch (request.type) {
+          case BlockDeviceRequestType.IN: {
+            let ok = true;
+            for (const desc of data) {
+              assert(desc.writable, "data must be writable when IN");
+              const read = await storage.read(offset, desc.array);
+              if (read !== desc.array.byteLength) {
+                ok = false;
+                break;
+              }
+              n += read;
+              offset += read;
             }
-            n += read;
-            offset += read;
-          }
-          set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
-          break;
-        }
-        case BlockDeviceRequestType.OUT: {
-          if (!storage.write) {
-            set_status(BlockDeviceStatus.UNSUPP);
+            set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
             break;
           }
-          let ok = true;
-          for (const desc of data) {
-            assert(!desc.writable, "data must be readonly when OUT");
-            const written = await storage.write(offset, desc.array);
-            if (written !== desc.array.byteLength) {
-              ok = false;
+          case BlockDeviceRequestType.OUT: {
+            if (!storage.write) {
+              set_status(BlockDeviceStatus.UNSUPP);
               break;
             }
-            n += written;
-            offset += written;
-          }
-          set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
-          break;
-        }
-        case BlockDeviceRequestType.FLUSH: {
-          if (!storage.flush) {
-            set_status(BlockDeviceStatus.UNSUPP);
+            let ok = true;
+            for (const desc of data) {
+              assert(!desc.writable, "data must be readonly when OUT");
+              const written = await storage.write(offset, desc.array);
+              if (written !== desc.array.byteLength) {
+                ok = false;
+                break;
+              }
+              n += written;
+              offset += written;
+            }
+            set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
             break;
           }
-          await storage.flush();
-          set_status(BlockDeviceStatus.OK);
-          break;
+          case BlockDeviceRequestType.FLUSH: {
+            if (!storage.flush) {
+              set_status(BlockDeviceStatus.UNSUPP);
+              break;
+            }
+            await storage.flush();
+            set_status(BlockDeviceStatus.OK);
+            break;
+          }
+          case BlockDeviceRequestType.GET_ID: {
+            console.log("GET_ID");
+            set_status(BlockDeviceStatus.OK);
+            break;
+          }
+          default:
+            console.error("unknown request type", request.type);
+            set_status(BlockDeviceStatus.UNSUPP);
         }
-        case BlockDeviceRequestType.GET_ID: {
-          console.log("GET_ID");
-          set_status(BlockDeviceStatus.OK);
-          break;
-        }
-        default:
-          console.error("unknown request type", request.type);
-          set_status(BlockDeviceStatus.UNSUPP);
+      } catch (error) {
+        console.error("block device I/O failed", error);
+        set_status(BlockDeviceStatus.IOERR);
       }
 
       chain.release(n);
@@ -152,6 +157,22 @@ export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
 
   return new VirtioController(
     { deviceId: 2, features, config },
-    { queues: [notify], close: () => storage.close?.() },
+    {
+      queues: [notify],
+      async close() {
+        let failure: unknown;
+        try {
+          await storage.flush?.();
+        } catch (error) {
+          failure = error;
+        }
+        try {
+          await storage.close?.();
+        } catch (error) {
+          failure ??= error;
+        }
+        if (failure) throw failure;
+      },
+    },
   ).device;
 }

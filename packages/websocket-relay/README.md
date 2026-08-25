@@ -45,6 +45,11 @@ Do not expose the relay directly to an untrusted network. It grants clients
 the ability to resolve names and open arbitrary outbound TCP connections,
 which is equivalent to an unauthenticated forward proxy.
 
+For CONNECT requests, the guest's Ethernet gateway address `192.0.2.1` maps to
+the relay host's `127.0.0.1`. The guest can therefore reach an APK repository
+or another service that is deliberately bound only to the native loopback
+interface. This mapping does not apply to DNS requests or any other address.
+
 Published raw TCP ports do not pass through the HTTP/WebSocket reverse proxy,
 so its authentication and origin checks do not protect them. Keep publication
 addresses on loopback or another trusted interface unless the guest service
@@ -72,7 +77,8 @@ drain. The same instance cannot be run again after stop; destroy it and create
 a fresh instance when applying new configuration.
 
 Run the direct library lifecycle test with `make test`. It covers origin
-enforcement, ephemeral WebSocket and publication listeners, a live inbound
-flow, synchronous shutdown, recreation, and descriptor cleanup.
+enforcement, the guest-gateway loopback mapping, ephemeral WebSocket and
+publication listeners, live outbound and inbound flows, synchronous shutdown,
+recreation, and descriptor cleanup.
 
 The protocol is documented in [PROTOCOL.md](./PROTOCOL.md).

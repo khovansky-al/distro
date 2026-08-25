@@ -12,6 +12,7 @@ mkdir -p \
   "$target/dev" \
   "$target/mnt" \
   "$target/proc" \
+  "$target/root" \
   "$target/run" \
   "$target/sys" \
   "$target/tmp"

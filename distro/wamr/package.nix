@@ -41,9 +41,13 @@ stdenv.mkDerivation (finalAttrs: {
   # WAMR 2.4.4 also fails to read or write a standalone wasm_global_new global:
   # it only consults globals belonging to a module instance. Edge.js creates
   # those host globals for WebAssembly.Global, so retain their value in init.
+  # Its C API also stubs host memory growth even though the interpreter already
+  # exposes indexed growth; Emscripten libraries such as Yarn's libzip grow
+  # their heap through WebAssembly.Memory.grow.
   patches = [
     ./platform-gaps.patch
     ./standalone-globals.patch
+    ./host-memory-grow.patch
   ];
 
   # The project file lives here rather than in WAMR's tree: WAMR expects each

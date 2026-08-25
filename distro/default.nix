@@ -96,6 +96,7 @@ lib.makeScope (scope: lib.callPackageWith ({ inherit lib pkgs; } // scope)) (
     # ./npm is this repository's own published npm packages; the guest's npm
     # command line lives in ./npm-cli.
     npm = callPackage ./npm-cli/package.nix { };
+    pnpm = callPackage ./pnpm/package.nix { };
     openssl = callPackage ./openssl/package.nix { };
     patch = callPackage ./patch/package.nix { };
     python = callPackage ./python/package.nix { };
@@ -116,6 +117,7 @@ lib.makeScope (scope: lib.callPackageWith ({ inherit lib pkgs; } // scope)) (
     xz = callPackage ./xz/package.nix { };
     zlib = callPackage ./zlib/package.nix { };
     zstd = callPackage ./zstd/package.nix { };
+    yarn = callPackage ./yarn/package.nix { };
 
     # Early platform tests boot without the guest agent so a broken SDK cannot
     # hide whether the kernel and libc reached userspace correctly.

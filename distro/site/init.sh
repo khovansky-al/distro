@@ -1,7 +1,8 @@
 #!/bin/busybox sh
 
 PATH=/bin:/sbin:/usr/bin:/usr/sbin
-export PATH
+HOME=/root
+export HOME PATH
 
 # A name for the machine so the motd reads like a real host.
 [ "$(hostname)" = "(none)" ] && hostname lowland

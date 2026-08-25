@@ -118,6 +118,26 @@ test("rejects more than one guest agent", async () => {
   );
 });
 
+test("can recovery-boot EROFS alongside an ext4 system disk", async () => {
+  const guest = guestAgent();
+  const machine = await bootMachine({
+    cpus: 1,
+    args: ["lowland.root.overlay=tmpfs", "lowland.root.prefer=erofs"],
+    plugins: [root_device(), ext4_root_device(), guest],
+  });
+  try {
+    const probe = await guest.exec([
+      "sh",
+      "-c",
+      "grep -q ' / overlay ' /proc/mounts && test -b /dev/vdb && ! grep -q '^/dev/vdb ' /proc/mounts",
+    ]);
+    assert.deepEqual(await probe.status, { code: 0, signal: null, success: true });
+  } finally {
+    machine.close();
+    await machine.closed;
+  }
+});
+
 test("boots a writable ext4 system disk", async () => {
   const { agent: guest, machine } = await boot(ext4_root_device());
   try {

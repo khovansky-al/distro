@@ -48,23 +48,28 @@ stdenv.mkDerivation (finalAttrs: {
   NIX_CXXSTDLIB_COMPILE = "-nostdinc++ -isystem ${sysroot}/include/c++/v1 -isystem ${sysroot}/include/${platform.multiarchTriple}/c++/v1 -nostdlib++";
   NIX_CXXSTDLIB_LINK = "-lc++ -lc++abi";
 
-  # The last two patches touch the pinned N-API and QuickJS checkouts that
+  # The N-API and QuickJS patches below touch the pinned checkouts that
   # postUnpack stages, not Edge.js's own tree, so they cannot live in the port
   # patch generated from the Edge.js repository. patchPhase runs after
-  # unpackPhase, so the files they edit are present by then.
+  # unpackPhase, so those files are present by then.
   #
-  # The last two are not port concerns either, which is why they are separate.
+  # These are not port concerns either, which is why they are separate.
   # napi-fatal-error implements a function the N-API header declares and the V8
   # provider has but the QuickJS one never did. threadsafe-function replaces a
   # napi_call_threadsafe_function that accepted every call, returned napi_ok and
   # discarded it: any addon that settles a promise from another thread — which
   # is every asynchronous napi-rs API — hung forever with no error anywhere.
+  # quickjs-thread-signature corrects a wasm-only pthread function-pointer trap.
+  # quickjs-buffer-memory makes Node Buffer backing stores visible to QuickJS's
+  # heap pressure, so unreachable Buffer cycles are collected before exhausting
+  # wasm32 memory.
   patches = [
     ./static-system-openssl.patch
     ./linux-wasm-port.patch
     ./napi-fatal-error.patch
     ./threadsafe-function.patch
     ./quickjs-thread-signature.patch
+    ./quickjs-buffer-memory.patch
   ];
 
   postUnpack = ''
@@ -201,9 +206,10 @@ stdenv.mkDerivation (finalAttrs: {
     #
     # The release suffix must move whenever the build changes without the source
     # revision moving, or apk sees the installed version and declines the
-    # upgrade. -r3 adds the standalone WAMR global fix used by Vite's
-    # WebAssembly-based dependency processing.
-    apk.version = "0.1.0_git20260815-r3";
+    # upgrade. -r8 includes WebAssembly imports, export-call semantics and
+    # memory growth, worker execArgv compatibility, and bounded Buffer memory
+    # under Yarn's cache and archive workloads.
+    apk.version = "0.1.0_git20260815-r8";
     checks = {
       node-version = vm-test.installedTest {
         name = "edgejs-node-version";
@@ -219,6 +225,17 @@ stdenv.mkDerivation (finalAttrs: {
       async-io = vm-test.installedTest {
         name = "edgejs-async-io";
         init = ./async-io-test.sh;
+        contents = [
+          busybox
+          finalAttrs.finalPackage
+        ];
+      };
+      # Unsafe Buffer backing stores must contribute to QuickJS heap pressure.
+      # Yarn's zlib/link path otherwise accumulates dead cyclic Buffer graphs
+      # until the wasm32 process runs out of address space.
+      buffer-memory = vm-test.installedTest {
+        name = "edgejs-buffer-memory";
+        init = ./buffer-memory-test.sh;
         contents = [
           busybox
           finalAttrs.finalPackage

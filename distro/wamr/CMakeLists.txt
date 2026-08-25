@@ -39,6 +39,12 @@ set(WAMR_BUILD_LAZY_JIT 0)
 # The C API is the whole point of this build.
 set(WAMR_BUILD_LIB_WASM_C_API 1)
 
+# A wasm_c_api host may grow an exported memory even when the module contains
+# no memory.grow opcode. Preserve the module's declared maximum so that host
+# growth remains possible; the default loader otherwise collapses it to the
+# initial size as an interpreter-only optimization.
+add_definitions(-DWASM_ENABLE_HOST_MEMORY_GROW=1)
+
 # No WASI and no builtin libc: the modules this runs are self-contained. The
 # one it exists for, es-module-lexer's, imports nothing at all.
 set(WAMR_BUILD_LIBC_BUILTIN 0)

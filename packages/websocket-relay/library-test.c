@@ -76,6 +76,27 @@ static int connect_loopback(uint16_t port)
 	return socket_fd;
 }
 
+static int listen_loopback(uint16_t *port)
+{
+	struct sockaddr_in address = {
+		.sin_family = AF_INET,
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	socklen_t address_length = sizeof(address);
+	int enabled = 1;
+	int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+	if (socket_fd < 0)
+		fail("could not create upstream listener");
+	setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+	if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0 ||
+	    listen(socket_fd, 1) < 0 ||
+	    getsockname(socket_fd, (struct sockaddr *)&address, &address_length) < 0)
+		fail("could not bind upstream listener");
+	*port = ntohs(address.sin_port);
+	return socket_fd;
+}
+
 static int websocket(uint16_t port, const char *origin, int expected_status)
 {
 	char request[1024], response[2048];
@@ -190,13 +211,19 @@ static void one_lifecycle(void)
 		.publication_count = 1,
 	};
 	unsigned char message[64], bind[] = { 0x06, 0, 0, 0x1f, 0x90 };
+	unsigned char connect_request[] = {
+		0x01, 0, 0, '1', '9', '2', '.', '0', '.', '2', '.', '1'
+	};
 	unsigned char accept_request[17] = { 0x07 };
 	struct lowland_relay *relay;
 	pthread_t relay_thread;
-	uint16_t relay_port, published_port;
+	uint16_t relay_port, published_port, upstream_port;
 	char error[256], byte;
-	int rejected, control, native, pending_native, flow;
+	int rejected, control, outbound, upstream_listener, upstream;
+	int native, pending_native, flow;
 	size_t length;
+
+	upstream_listener = listen_loopback(&upstream_port);
 
 	relay = lowland_relay_create(&config, error, sizeof(error));
 	if (!relay)
@@ -209,6 +236,33 @@ static void one_lifecycle(void)
 
 	rejected = websocket(relay_port, "http://wrong.invalid", 0);
 	close(rejected);
+	outbound = websocket(relay_port, ORIGIN, 101);
+	connect_request[1] = (unsigned char)(upstream_port >> 8);
+	connect_request[2] = (unsigned char)upstream_port;
+	websocket_send_binary(outbound, connect_request, sizeof(connect_request));
+	upstream = accept(upstream_listener, NULL, NULL);
+	if (upstream < 0)
+		fail("guest gateway did not map to native loopback");
+	length = websocket_receive_binary(outbound, message, sizeof(message));
+	if (length != 1 || message[0] != 0x81)
+		fail("outbound loopback flow was not connected");
+	message[0] = 0x03;
+	message[1] = 'g';
+	websocket_send_binary(outbound, message, 2);
+	read_exact(upstream, &byte, 1);
+	if (byte != 'g')
+		fail("outbound loopback flow did not carry guest data");
+	byte = 'h';
+	send_all(upstream, &byte, 1);
+	length = websocket_receive_binary(outbound, message, sizeof(message));
+	if (length != 2 || message[0] != 0x03 || message[1] != 'h')
+		fail("outbound loopback flow did not carry host data");
+	message[0] = 0x05;
+	websocket_send_binary(outbound, message, 1);
+	close(outbound);
+	close(upstream);
+	close(upstream_listener);
+
 	control = websocket(relay_port, ORIGIN, 101);
 	websocket_send_binary(control, bind, sizeof(bind));
 	length = websocket_receive_binary(control, message, sizeof(message));

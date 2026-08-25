@@ -19,9 +19,11 @@ for p in file http https; do
   echo "$protocols" | grep -qw "$p" || fail "protocol $p missing from: $protocols"
 done
 
-# HTTPS leaves the guest through the host Fetch bridge, so curl must not bake a
-# nonexistent guest trust-store path into the package.
-[ -z "$(curl-config --ca)" ] || fail "unexpected default CA bundle: $(curl-config --ca)"
+# The browser relay carries TLS bytes unchanged, so curl validates peers in the
+# guest against the CA bundle installed by its package dependency.
+[ "$(curl-config --ca)" = /etc/ssl/certs/ca-certificates.crt ] ||
+  fail "unexpected default CA bundle: $(curl-config --ca)"
+[ -s /etc/ssl/certs/ca-certificates.crt ] || fail "default CA bundle is missing"
 
 # (b) file:// round trip: fetch a local file through curl and byte-compare.
 : >/tmp/data

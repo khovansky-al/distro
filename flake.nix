@@ -140,6 +140,21 @@
             exec ${pkgs.wrangler}/bin/wrangler \
               "$@" --config distro/site/wrangler.toml
           '';
+          proofFonts = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+          proofBrowsers = pkgs.playwright-driver.selectBrowsers {
+            withChromium = true;
+            withChromiumHeadlessShell = true;
+            withFirefox = false;
+            withWebkit = false;
+            withFfmpeg = false;
+            fontconfig_file = proofFonts;
+          };
+          actualProofSource = pkgs.runCommand "actual-proof-source" { } ''
+            mkdir -p $out/node_modules
+            cp ${./actual-proof.mjs} $out/actual-proof.mjs
+            cp -r ${pkgs.playwright-test}/lib/node_modules/playwright $out/node_modules/playwright
+            cp -r ${pkgs.playwright-test}/lib/node_modules/playwright-core $out/node_modules/playwright-core
+          '';
         in
         {
           artifacts = {
@@ -158,6 +173,29 @@
                   for asset in "$test_assets"/*; do
                     install -Dm0644 "$asset" "packages/linux-guest/$(basename "$asset")"
                   done
+                '';
+              }
+            );
+          };
+
+          actual-proof = {
+            type = "app";
+            program = lib.getExe (
+              pkgs.writeShellApplication {
+                name = "actual-proof";
+                runtimeInputs = [ pkgs.nodejs ];
+                text = ''
+                  export __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json
+                  export ACTUAL_PROOF_RELAY=${wasmpkgs.websocket-relay}/bin/lowland-websocket-relay
+                  export ACTUAL_PROOF_REPOSITORY=${wasmpkgs.repository}
+                  export ACTUAL_PROOF_SITE=${wasmpkgs.site.package}
+                  export FONTCONFIG_FILE=${proofFonts}
+                  export LIBGL_ALWAYS_SOFTWARE=1
+                  export LIBGL_DRIVERS_PATH=${pkgs.mesa}/lib/dri
+                  export PLAYWRIGHT_BROWSERS_PATH=${proofBrowsers}
+                  export PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu-24.04
+                  export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+                  exec node ${actualProofSource}/actual-proof.mjs "$@"
                 '';
               }
             );

@@ -7,6 +7,8 @@ stdenv.mkDerivation {
   pname = "e2fsprogs";
   inherit (pkgs.e2fsprogs) version src;
 
+  patches = [ ./no-fork-logfile.patch ];
+
   # configure builds generators that run on the build platform while the
   # filesystem tools themselves target wasm.
   depsBuildBuild = [ pkgs.stdenv.cc ];
@@ -29,12 +31,10 @@ stdenv.mkDerivation {
     "--disable-debugfs"
     "--disable-defrag"
     "--disable-e2initrd-helper"
-    "--disable-fsck"
     "--disable-fuse2fs"
     "--disable-imager"
     "--disable-mmp"
     "--disable-nls"
-    "--disable-resizer"
     "--disable-rpath"
     "--disable-tdb"
     "--disable-tls"
@@ -47,9 +47,10 @@ stdenv.mkDerivation {
     "--with-udev-rules-dir=no"
   ];
 
-  # The installer needs the real ext4 formatter, not BusyBox's ext2-only
-  # applet. Building only its library closure also avoids porting unrelated
-  # interactive utilities whose pager implementation requires fork().
+  # The installer needs the real ext4 formatter, and browser-persistent disks
+  # need the offline checker and resizer for legacy growth. Build only those
+  # tools and their library closure, avoiding unrelated interactive utilities
+  # whose pager implementation requires fork().
   buildPhase = ''
     runHook preBuild
     make top-deps
@@ -57,12 +58,16 @@ stdenv.mkDerivation {
       make -C "$directory"
     done
     make -C misc mke2fs
+    make -C e2fsck e2fsck
+    make -C resize resize2fs
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     install -Dm755 misc/mke2fs "$out/sbin/mke2fs"
+    install -Dm755 e2fsck/e2fsck "$out/sbin/e2fsck"
+    install -Dm755 resize/resize2fs "$out/sbin/resize2fs"
     install -Dm644 misc/mke2fs.conf "$out/etc/mke2fs.conf"
     runHook postInstall
   '';

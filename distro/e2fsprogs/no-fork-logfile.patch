@@ -1,0 +1,13 @@
+diff --git a/e2fsck/logfile.c b/e2fsck/logfile.c
+index 3b459cb7..17d0412e 100644
+--- a/e2fsck/logfile.c
++++ b/e2fsck/logfile.c
+@@ -213,0 +214,6 @@ static FILE *save_output(const char *s0, const char *s1, const char *s2)
++#ifdef __wasm__
++        (void)s0;
++        (void)s1;
++        (void)s2;
++        return NULL;
++#else
+@@ -287,0 +294 @@ static FILE *save_output(const char *s0, const char *s1, const char *s2)
++#endif

@@ -48,10 +48,13 @@ in
       suite,
     }:
     pkgs.runCommand name
-      ({
-        nativeBuildInputs = [ pkgs.nodejs ];
-        passthru.ci.heavy = true;
-      } // environment)
+      (
+        {
+          nativeBuildInputs = [ pkgs.nodejs ];
+          passthru.ci.heavy = true;
+        }
+        // environment
+      )
       ''
         export TMPDIR="$NIX_BUILD_TOP/tmp"
         export HOME="$TMPDIR/home"
