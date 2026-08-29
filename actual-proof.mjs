@@ -171,6 +171,7 @@ async function readGuestFile(page, path) {
 }
 
 async function command(page, shell, marker, timeout = 180_000, diagnosticPath) {
+  const startedAt = performance.now();
   const failure = `${marker}-failed`;
   const markerPrint = (value) => {
     const split = Math.floor(value.length / 2);
@@ -191,7 +192,9 @@ async function command(page, shell, marker, timeout = 180_000, diagnosticPath) {
     );
   } catch (error) {
     const text = (await page.locator(".xterm-rows").textContent()) ?? "";
-    throw new Error(`${marker} timed out: ${text}`, { cause: error });
+    throw new Error(`${marker} timed out after ${(performance.now() - startedAt).toFixed(0)}ms: ${text}`, {
+      cause: error,
+    });
   }
   const text = (await page.locator(".xterm-rows").textContent()) ?? "";
   if (text.includes(failure)) {
@@ -201,9 +204,11 @@ async function command(page, shell, marker, timeout = 180_000, diagnosticPath) {
         (error) => `could not retrieve ${diagnosticPath}: ${error.stack ?? error}`,
       );
     }
-    throw new Error(`${failure}:\n${diagnostic}\nterminal:\n${text}`);
+    throw new Error(
+      `${failure} after ${(performance.now() - startedAt).toFixed(0)}ms:\n${diagnostic}\nterminal:\n${text}`,
+    );
   }
-  console.log(`[guest] ${marker}`);
+  console.log(`[guest] ${marker} ${(performance.now() - startedAt).toFixed(0)}ms`);
 }
 
 async function publishedPort(page) {
@@ -357,7 +362,7 @@ try {
 
   await command(
     vm,
-    "printf '%s\\n' '<div>actual-proof-live-edit</div>' >> /work/actual/packages/desktop-client/index.html",
+    "sed -i '/actual-proof-live-edit/d' /work/actual/packages/desktop-client/index.html; printf '%s\\n' '<div>actual-proof-live-edit</div>' >> /work/actual/packages/desktop-client/index.html",
     "actual-proof-source-edited",
   );
   await actual.reload({ waitUntil: "domcontentloaded" });
