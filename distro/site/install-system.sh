@@ -4,6 +4,26 @@ set -e
 target=/mnt
 repository=http://assets.low.land/apk/wasm32/Packages.adb
 
+fail() {
+  printf 'install-lowland: %s\n' "$*" >&2
+  exit 1
+}
+
+# Make the destructive target checks explicit: this command is valid only in
+# the recovery overlay and never formats a mounted disk or one with holders.
+grep -q '^overlay / overlay ' /proc/mounts ||
+  fail 'the recovery overlay is not mounted as /; refusing to format /dev/vdb'
+[ ! -e /etc/lowland-installed ] ||
+  fail 'this system is already installed; refusing to format /dev/vdb'
+[ -b /dev/vdb ] || fail '/dev/vdb is not a block device'
+[ "$(cat /sys/class/block/vdb/ro)" = 0 ] || fail '/dev/vdb is read-only'
+if grep -q '^/dev/vdb' /proc/mounts; then
+  fail '/dev/vdb or one of its partitions is mounted'
+fi
+for holder in /sys/class/block/vdb/holders/*; do
+  [ ! -e "$holder" ] || fail "/dev/vdb is held by ${holder##*/}"
+done
+
 mkdir -p "$target"
 mke2fs -q -t ext4 -F -L LOWLAND_ROOT -m 0 /dev/vdb
 mount -t ext4 /dev/vdb "$target"
