@@ -1,0 +1,272 @@
+diff --git a/napi/quickjs/deps/quickjs/quickjs.c b/napi/quickjs/deps/quickjs/quickjs.c
+index d887882..524930b 100644
+--- a/napi/quickjs/deps/quickjs/quickjs.c
++++ b/napi/quickjs/deps/quickjs/quickjs.c
+@@ -243,12 +243,6 @@ typedef struct JSStringRope JSStringRope;
+ #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
+ #define JS_VALUE_GET_STRING_ROPE(v) ((JSStringRope *)JS_VALUE_GET_PTR(v))
+ 
+-typedef enum {
+-    JS_GC_PHASE_NONE,
+-    JS_GC_PHASE_DECREF,
+-    JS_GC_PHASE_REMOVE_CYCLES,
+-} JSGCPhaseEnum;
+-
+ typedef struct JSMallocState {
+     size_t malloc_count;
+     size_t malloc_size;
+@@ -293,6 +287,10 @@ struct JSRuntime {
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+     size_t malloc_gc_threshold;
++    /* Called at the end of JS_RunGC, once the cycle collection has completed
++       and gc_phase is back to JS_GC_PHASE_NONE. See JS_SetGCEpilogueHandler. */
++    JSGCEpilogueHandler *gc_epilogue_cb;
++    void *gc_epilogue_opaque;
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head string_list; /* list of JSString.link */
+ #endif
+@@ -2141,6 +2139,17 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
+ }
+ 
++void JS_SetGCEpilogueHandler(JSRuntime *rt, JSGCEpilogueHandler *cb, void *opaque)
++{
++    rt->gc_epilogue_cb = cb;
++    rt->gc_epilogue_opaque = opaque;
++}
++
++JSGCPhaseEnum JS_GetGCPhase(JSRuntime *rt)
++{
++    return rt->gc_phase;
++}
++
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -2322,6 +2331,10 @@ void JS_FreeRuntime(JSRuntime *rt)
+ 
+     JS_RunGC(rt);
+ 
++    /* Give the epilogue handler a chance to release what it queued for this
++       runtime before the runtime memory itself goes away. */
++    if (unlikely(rt->gc_epilogue_cb != NULL))
++        rt->gc_epilogue_cb(rt, rt->gc_epilogue_opaque, true);
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     /* leaking objects */
+     if (check_dump_flag(rt, JS_DUMP_LEAKS)) {
+@@ -7138,6 +7151,12 @@ void JS_RunGC(JSRuntime *rt)
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++
++    /* The collection has completed: gc_phase is JS_GC_PHASE_NONE and every
++       object condemned above has been freed or released to its surviving
++       references. Host code queued during the sweep can run safely now. */
++    if (unlikely(rt->gc_epilogue_cb != NULL))
++        rt->gc_epilogue_cb(rt, rt->gc_epilogue_opaque, false);
+ }
+ 
+ /* Return false if not an object or if the object has already been
+diff --git a/napi/quickjs/deps/quickjs/quickjs.h b/napi/quickjs/deps/quickjs/quickjs.h
+index dd758f9..633250a 100644
+--- a/napi/quickjs/deps/quickjs/quickjs.h
++++ b/napi/quickjs/deps/quickjs/quickjs.h
+@@ -145,6 +145,19 @@ typedef struct JSClass JSClass;
+ typedef uint32_t JSClassID;
+ typedef uint32_t JSAtom;
+ 
++/* Phase of the garbage collector, as returned by JS_GetGCPhase. Host code
++   must never call back into JavaScript or N-API while the collector is in
++   JS_GC_PHASE_REMOVE_CYCLES: the objects it would observe are condemned.
++   Queue such work and run it from a JS_GCEpilogueHandler instead. */
++typedef enum {
++    JS_GC_PHASE_NONE,
++    JS_GC_PHASE_DECREF,
++    JS_GC_PHASE_REMOVE_CYCLES,
++} JSGCPhaseEnum;
++
++/* Returns the phase of the garbage collector on rt. */
++JS_EXTERN JSGCPhaseEnum JS_GetGCPhase(JSRuntime *rt);
++
+ /* Unless documented otherwise, C string pointers (`char *` or `const char *`)
+    are assumed to verify these constraints:
+    - unless a length is passed separately, the string has a null terminator
+@@ -1171,6 +1184,16 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
+ /* return != 0 if the JS code needs to be interrupted */
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
++/* Called at the end of every JS_RunGC, after the collector has finished and
++   gc_phase is back to JS_GC_PHASE_NONE. runtime_teardown is true when the
++   call comes from the final collection inside JS_FreeRuntime. Host code that
++   must not run while the collector is freeing cycles -- N-API finalizers, for
++   example, which would otherwise be able to resurrect a condemned object --
++   can queue work during the collection and run it from here. */
++typedef void JSGCEpilogueHandler(JSRuntime *rt, void *opaque,
++                                 bool runtime_teardown);
++JS_EXTERN void JS_SetGCEpilogueHandler(JSRuntime *rt, JSGCEpilogueHandler *cb,
++                                       void *opaque);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */
+diff --git a/napi/quickjs/src/internal/napi_external.cc b/napi/quickjs/src/internal/napi_external.cc
+index c636e2b..e7239e4 100644
+--- a/napi/quickjs/src/internal/napi_external.cc
++++ b/napi/quickjs/src/internal/napi_external.cc
+@@ -3,14 +3,99 @@
+ #include "internal/napi_env.h"
+ #include "internal/napi_util.h"
+ 
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++
+ namespace
+ {
++
+ JSClassID external_class_id = 0;
+ JSClassID external_record_class_id = 0;
+ 
+ const char k_type_tag_property[] = "__napi_type_tag__";
+ const char k_wrap_property[] = "__napi_wrap__";
+ const char k_finalizer_property[] = "__napi_finalizer__";
++
++// A user finalizer queued out of the garbage collector's cycle sweep.
++struct PendingFinalizer
++{
++  napi_external_backing_store_hint__ *hint;
++  // Captured when the hint is queued. Nothing runs between the sweep and the
++  // drain, so is_detaching() cannot change in between; deciding here keeps the
++  // drain faithful to the immediate path it replaced.
++  bool destroy_after_invoke;
++};
++
++struct PendingFinalizerQueue
++{
++  std::vector<PendingFinalizer> items;
++  // Set while this runtime's drain invokes user callbacks. A callback may
++  // allocate, start another collection, and re-enter the drain; the re-entrant
++  // pass returns immediately and the loop below drains what it queued.
++  bool draining = false;
++};
++
++std::mutex g_pending_finalizers_mutex;
++std::unordered_map<JSRuntime *, PendingFinalizerQueue> g_pending_finalizers;
++
++void queue_pending_finalizer(JSRuntime *rt,
++                             napi_external_backing_store_hint__ *hint,
++                             bool destroy_after_invoke)
++{
++  std::lock_guard<std::mutex> lock(g_pending_finalizers_mutex);
++  g_pending_finalizers[rt].items.push_back(PendingFinalizer{hint, destroy_after_invoke});
++}
++
++// JS_GC epilogue: the collection has completed and gc_phase is back to
++// JS_GC_PHASE_NONE, so it is safe to call into N-API. This is where the user's
++// finalizer callbacks actually run -- the same contract V8-based Node gives
++// them. QuickJS would otherwise run them from inside gc_free_cycles, where a
++// finalizer resolving a weak napi_ref (napi_get_reference_value) dups a value
++// the collector has condemned; the object then survives the sweep on
++// gc_zero_ref_count_list and the handle scope that received it frees it a
++// second time.
++void drain_pending_finalizers(JSRuntime *rt, void *opaque, bool runtime_teardown)
++{
++  (void)opaque;
++  PendingFinalizerQueue *queue = nullptr;
++  {
++    std::lock_guard<std::mutex> lock(g_pending_finalizers_mutex);
++    auto it = g_pending_finalizers.find(rt);
++    if (it == g_pending_finalizers.end())
++      return;
++    queue = &it->second;
++    if (queue->draining)
++      return;
++    queue->draining = true;
++  }
++
++  std::vector<PendingFinalizer> batch;
++  for (;;)
++  {
++    batch.clear();
++    {
++      std::lock_guard<std::mutex> lock(g_pending_finalizers_mutex);
++      batch.swap(queue->items);
++    }
++    if (batch.empty())
++      break;
++    for (const auto &pending : batch)
++    {
++      pending.hint->invoke_finalizer();
++      if (pending.destroy_after_invoke)
++        napi_external_backing_store_hint__::destroy_with_runtime(rt, pending.hint);
++    }
++  }
++
++  {
++    std::lock_guard<std::mutex> lock(g_pending_finalizers_mutex);
++    queue->draining = false;
++    if (runtime_teardown)
++      g_pending_finalizers.erase(rt);
++  }
++}
++
+ } // namespace
+ 
+ int napi_external__::register_class(JSRuntime *rt)
+@@ -27,7 +112,14 @@ int napi_external__::register_class(JSRuntime *rt)
+   JSClassDef record_def = {};
+   record_def.class_name = "NapiExternalRecord";
+   record_def.finalizer = finalizer;
+-  return JS_NewClass(rt, external_record_class_id, &record_def);
++  rc = JS_NewClass(rt, external_record_class_id, &record_def);
++  if (rc != 0)
++    return rc;
++
++  // Deferred finalizers are drained after every JS_RunGC. Registering on each
++  // env creation is idempotent: the same handler overwrites the same slot.
++  JS_SetGCEpilogueHandler(rt, drain_pending_finalizers, nullptr);
++  return 0;
+ }
+ 
+ JSClassID napi_external__::class_id()
+@@ -53,7 +145,6 @@ void *napi_external__::get_value(JSValueConst value)
+       JS_GetOpaque(value, external_class_id));
+   return hint == nullptr ? nullptr : hint->external_data();
+ }
+-
+ napi_external_backing_store_hint__ *napi_external__::get_wrap_record(JSContext *ctx, JSValueConst object)
+ {
+   auto *wrap = static_cast<napi_external_backing_store_hint__ *>(
+@@ -114,6 +205,15 @@ void napi_external__::free_external_array_buffer_data(JSRuntime *rt, void *opaqu
+   auto *hint = reinterpret_cast<napi_external_backing_store_hint__ *>(opaque);
+   if (hint == nullptr)
+     return;
++
++  if (JS_GetGCPhase(rt) == JS_GC_PHASE_REMOVE_CYCLES)
++  {
++    // Same hazard as the class finalizer below: an ArrayBuffer backing store is
++    // released during the sweep when its object dies there.
++    queue_pending_finalizer(rt, hint, !hint->is_detaching());
++    return;
++  }
++
+   hint->invoke_finalizer();
+   if (hint->is_detaching())
+     return;
+@@ -130,6 +230,16 @@ void napi_external__::finalizer(JSRuntime *rt, JSValue value)
+   if (hint == nullptr)
+     return;
+ 
++  if (JS_GetGCPhase(rt) == JS_GC_PHASE_REMOVE_CYCLES)
++  {
++    // The collector is freeing cycles. Run no user code here: a finalizer that
++    // resolves a weak napi_ref would dup a condemned object back into a live
++    // handle scope, and no N-API contract promises a finalizer can observe the
++    // collector mid-sweep. Queue the callback for the GC epilogue instead.
++    queue_pending_finalizer(rt, hint, true);
++    return;
++  }
++
+   hint->invoke_finalizer();
+   napi_external_backing_store_hint__::destroy_with_runtime(rt, hint);
+ }

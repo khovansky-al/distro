@@ -70,6 +70,16 @@ stdenv.mkDerivation (finalAttrs: {
     ./threadsafe-function.patch
     ./quickjs-thread-signature.patch
     ./quickjs-buffer-memory.patch
+    # napi-finalizer-deferral keeps N-API user finalizers out of QuickJS's
+    # cycle sweep. gc_free_cycles used to run them mid-collection, where a
+    # finalizer resolving a weak napi_ref (napi_get_reference_value) could dup
+    # a condemned TLSWrap back into a live handle scope; the object then
+    # survived the sweep and the scope's close freed it a second time,
+    # trapping the guest in malloc_usable_size during `yarn install`. The
+    # patch adds a JS_GC epilogue handler to QuickJS, queues the callbacks
+    # during the sweep, and drains them once JS_RunGC has completed -- the
+    # same contract V8-based Node gives finalizers.
+    ./napi-finalizer-deferral.patch
   ];
 
   postUnpack = ''
@@ -203,13 +213,15 @@ stdenv.mkDerivation (finalAttrs: {
   passthru = {
     # Alpine versions cannot contain the Nix-style "-unstable-YYYY-MM-DD"
     # suffix; this metadata is already a full APK version including release.
-    #
     # The release suffix must move whenever the build changes without the source
     # revision moving, or apk sees the installed version and declines the
     # upgrade. -r8 includes WebAssembly imports, export-call semantics and
     # memory growth, worker execArgv compatibility, and bounded Buffer memory
-    # under Yarn's cache and archive workloads.
-    apk.version = "0.1.0_git20260815-r8";
+    # under Yarn's cache and archive workloads. -r9 defers N-API user finalizers
+    # out of QuickJS's cycle sweep (napi-finalizer-deferral.patch): finalizers
+    # running mid-sweep could resurrect a condemned TLSWrap through
+    # napi_get_reference_value and double-free it during `yarn install`.
+    apk.version = "0.1.0_git20260815-r9";
     checks = {
       node-version = vm-test.installedTest {
         name = "edgejs-node-version";
