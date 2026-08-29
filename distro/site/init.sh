@@ -4,6 +4,19 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin
 HOME=/root
 export HOME PATH
 
+# The persistent browser disk is solid-state storage and benefits from avoiding
+# rotational heuristics. Keep the tuning scoped to writable virtio disks so the
+# read-only live image retains its defaults.
+for device in /sys/block/vd*; do
+  [ -r "$device/ro" ] && [ "$(cat "$device/ro")" = 0 ] || continue
+  queue="$device/queue"
+  [ -w "$queue/rotational" ] && printf '0\n' >"$queue/rotational"
+  [ -w "$queue/read_ahead_kb" ] && printf '128\n' >"$queue/read_ahead_kb"
+  if [ -w "$queue/scheduler" ] && grep -qw none "$queue/scheduler"; then
+    printf 'none\n' >"$queue/scheduler"
+  fi
+done
+
 # A name for the machine so the motd reads like a real host.
 [ "$(hostname)" = "(none)" ] && hostname lowland
 

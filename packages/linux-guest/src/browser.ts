@@ -2,6 +2,7 @@
 
 import {
   type BlockDeviceStorage,
+  closeVirtioDevice,
   type FS,
   type FSAttributes,
   type FSCreateContext,
@@ -9,6 +10,8 @@ import {
   FSError,
   type FSSetAttributes,
   type FSTimestamp,
+  type VirtioDevice,
+  workerDevice,
 } from "@lowland/kernel";
 
 export { opfsBlockErrorCode } from "./opfs-block-errors.js";
@@ -26,6 +29,11 @@ export class OPFSBlockStorageError extends Error {
 export interface OPFSBlockStorage extends BlockDeviceStorage, AsyncDisposable {
   readonly capacity: number;
   readonly closed: Promise<void>;
+  close(): Promise<void>;
+}
+
+export interface OPFSBlockDevice extends VirtioDevice, AsyncDisposable {
+  readonly capacity: number;
   close(): Promise<void>;
 }
 
@@ -110,16 +118,37 @@ interface WorkerResponse {
   error?: { name: string; message: string; code: string };
 }
 
-/**
- * Opens a random-access OPFS file as virtio block storage.
- *
- * A dedicated worker owns the synchronous access handle. Only requested byte
- * ranges cross the worker boundary, and a Web Lock prevents another tab from
- * mounting the same origin-private disk at the same time.
- */
-export async function openOPFSBlockStorage(
-  options: OpenOPFSBlockStorageOptions = {},
-): Promise<OPFSBlockStorage> {
+interface PreparedOPFSDisk {
+  capacity: number;
+  configuration: {
+    directory?: FileSystemDirectoryHandle;
+    originPrivate?: boolean;
+    name: string;
+    create: boolean;
+    capacity: number;
+    segmentSize: number;
+  };
+  release(): Promise<void>;
+}
+
+function opfs_block_failure(error: unknown) {
+  return error instanceof OPFSBlockStorageError
+    ? error
+    : new OPFSBlockStorageError(error instanceof Error ? error.message : String(error), "EIO", {
+        cause: error,
+      });
+}
+
+function worker_response_failure(response: {
+  error?: { name: string; message: string; code: string };
+}) {
+  const detail = response.error;
+  return new OPFSBlockStorageError(detail?.message ?? "OPFS block operation failed", detail?.code, {
+    cause: detail,
+  });
+}
+
+async function prepareOPFSDisk(options: OpenOPFSBlockStorageOptions): Promise<PreparedOPFSDisk> {
   if (!navigator.storage?.getDirectory) {
     throw new OPFSBlockStorageError("this browser does not support OPFS", "ENOSYS");
   }
@@ -128,12 +157,14 @@ export async function openOPFSBlockStorage(
   }
   const directory = options.directory ?? (await navigator.storage.getDirectory());
   const name = options.name ?? "root.ext4";
-  const file = await directory.getFileHandle(name, { create: options.create ?? true });
+  const create = options.create ?? true;
+  const file = await directory.getFileHandle(name, { create });
   const parts = await directory.resolve(file);
   const lockName = options.lockName ?? `@lowland/guest/opfs-block/${parts?.join("/") ?? name}`;
   const acquired = Promise.withResolvers<boolean>();
   const releaseLock = Promise.withResolvers<void>();
   let acquisitionSettled = false;
+  let released = false;
   const lockRequest = navigator.locks.request(
     lockName,
     { mode: "exclusive", ifAvailable: true },
@@ -147,14 +178,21 @@ export async function openOPFSBlockStorage(
     if (!acquisitionSettled) acquired.reject(error);
   });
   if (!(await acquired.promise)) {
+    await lockRequest;
     throw new OPFSBlockStorageError(`OPFS disk ${name} is already mounted in another tab`, "EBUSY");
   }
 
-  let requestedCapacity: number;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    releaseLock.resolve();
+    await lockRequest;
+  };
+
   try {
     const metadata = await readOPFSBlockMetadata(directory, name);
     const firstSegmentSize = (await file.getFile()).size;
-    requestedCapacity = metadata?.capacity ?? firstSegmentSize;
+    let requestedCapacity = metadata?.capacity ?? firstSegmentSize;
     if (options.capacity !== undefined) {
       if (!Number.isSafeInteger(options.capacity) || options.capacity <= 0) {
         throw new RangeError("OPFS disk capacity must be a positive safe integer");
@@ -176,15 +214,38 @@ export async function openOPFSBlockStorage(
     if (requestedCapacity > OPFS_BLOCK_SEGMENT_SIZE || metadata) {
       await writeOPFSBlockMetadata(directory, name, requestedCapacity);
     }
+    return {
+      capacity: requestedCapacity,
+      configuration: {
+        name,
+        create,
+        capacity: requestedCapacity,
+        segmentSize: OPFS_BLOCK_SEGMENT_SIZE,
+        ...(options.directory === undefined ? { originPrivate: true } : { directory }),
+      },
+      release,
+    };
   } catch (error) {
-    releaseLock.resolve();
-    await lockRequest.catch(() => {});
+    await release();
     throw error;
   }
+}
+
+/**
+ * Opens a random-access OPFS file as virtio block storage.
+ *
+ * A dedicated worker owns the synchronous access handle. Only requested byte
+ * ranges cross the worker boundary, and a Web Lock prevents another tab from
+ * mounting the same origin-private disk at the same time.
+ */
+export async function openOPFSBlockStorage(
+  options: OpenOPFSBlockStorageOptions = {},
+): Promise<OPFSBlockStorage> {
+  const prepared = await prepareOPFSDisk(options);
 
   const worker = new Worker(new URL("./opfs-block-worker.js", import.meta.url), {
     type: "module",
-    name: `OPFS block storage: ${name}`,
+    name: `OPFS block storage: ${prepared.configuration.name}`,
   });
   let nextId = 1;
   let closing = false;
@@ -197,19 +258,14 @@ export async function openOPFSBlockStorage(
   void closed.promise.catch(() => {});
 
   const fail = (error: unknown) => {
-    const failure =
-      error instanceof OPFSBlockStorageError
-        ? error
-        : new OPFSBlockStorageError(error instanceof Error ? error.message : String(error), "EIO", {
-            cause: error,
-          });
+    const failure = opfs_block_failure(error);
     if (fatalError) return;
     fatalError = failure;
     closing = true;
     for (const operation of pending.values()) operation.reject(failure);
     pending.clear();
     worker.terminate();
-    releaseLock.resolve();
+    void prepared.release().catch(() => {});
     closed.reject(failure);
   };
 
@@ -219,14 +275,7 @@ export async function openOPFSBlockStorage(
     if (!operation) return;
     pending.delete(response.id);
     if (response.ok) operation.resolve(response as unknown as Record<string, unknown>);
-    else {
-      const detail = response.error;
-      operation.reject(
-        new OPFSBlockStorageError(detail?.message ?? "OPFS block operation failed", detail?.code, {
-          cause: detail,
-        }),
-      );
-    }
+    else operation.reject(worker_response_failure(response));
   });
   worker.addEventListener("error", (event) => fail(event.error ?? new Error(event.message)));
   worker.addEventListener("messageerror", () => fail(new Error("invalid OPFS worker message")));
@@ -239,7 +288,12 @@ export async function openOPFSBlockStorage(
     const id = nextId++;
     const operation = Promise.withResolvers<Record<string, unknown>>();
     pending.set(id, operation);
-    worker.postMessage({ id, ...message }, transfer);
+    try {
+      worker.postMessage({ id, ...message }, transfer);
+    } catch (error) {
+      pending.delete(id);
+      throw error;
+    }
     return operation.promise;
   };
 
@@ -247,11 +301,7 @@ export async function openOPFSBlockStorage(
   try {
     opened = await call({
       type: "init",
-      file,
-      directory,
-      name,
-      capacity: requestedCapacity,
-      segmentSize: OPFS_BLOCK_SEGMENT_SIZE,
+      ...prepared.configuration,
     });
   } catch (error) {
     fail(error);
@@ -307,8 +357,7 @@ export async function openOPFSBlockStorage(
       try {
         await call({ type: "close" });
         worker.terminate();
-        releaseLock.resolve();
-        await lockRequest;
+        await prepared.release();
         closed.resolve();
       } catch (error) {
         fail(error);
@@ -321,6 +370,102 @@ export async function openOPFSBlockStorage(
     },
   };
   return storage;
+}
+
+interface DeviceWorkerInitialization {
+  type: "initialized";
+  ok: boolean;
+  capacity?: number;
+  error?: { name: string; message: string; code: string };
+}
+
+function initializeOPFSBlockDeviceWorker(worker: Worker, prepared: PreparedOPFSDisk) {
+  return new Promise<number>((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener("message", message);
+      worker.removeEventListener("error", error);
+      worker.removeEventListener("messageerror", messageerror);
+    };
+    const message = (event: MessageEvent<DeviceWorkerInitialization>) => {
+      const response = event.data;
+      if (response?.type !== "initialized") return;
+      cleanup();
+      if (!response.ok) reject(worker_response_failure(response));
+      else if (typeof response.capacity !== "number") {
+        reject(new OPFSBlockStorageError("OPFS block device worker returned no capacity"));
+      } else resolve(response.capacity);
+    };
+    const error = (event: ErrorEvent) => {
+      cleanup();
+      reject(event.error ?? new Error(event.message));
+    };
+    const messageerror = () => {
+      cleanup();
+      reject(new Error("invalid OPFS block device worker message"));
+    };
+    worker.addEventListener("message", message);
+    worker.addEventListener("error", error);
+    worker.addEventListener("messageerror", messageerror);
+    try {
+      worker.postMessage({
+        type: "initialize",
+        ...prepared.configuration,
+      });
+    } catch (initializationError) {
+      cleanup();
+      reject(initializationError);
+    }
+  });
+}
+
+/**
+ * Opens a segmented OPFS disk as a worker-served virtio block device.
+ *
+ * Prefer this API when attaching the disk to `bootMachine()`: virtio request
+ * handling and synchronous OPFS access stay in the same worker. The lower-level
+ * `openOPFSBlockStorage()` remains available to callers that need direct range
+ * reads and writes instead of a device.
+ */
+export async function openOPFSBlockDevice(
+  options: OpenOPFSBlockStorageOptions = {},
+): Promise<OPFSBlockDevice> {
+  const prepared = await prepareOPFSDisk(options);
+  const worker = new Worker(new URL("./opfs-block-device-worker.js", import.meta.url), {
+    type: "module",
+    name: `OPFS block device: ${prepared.configuration.name}`,
+  });
+
+  try {
+    const capacity = await initializeOPFSBlockDeviceWorker(worker, prepared);
+    const opening = workerDevice(worker);
+    worker.postMessage({ type: "serve" });
+    const device = await opening;
+    let cleanupStarted = false;
+    const cleanup = async () => {
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      worker.terminate();
+      await prepared.release();
+    };
+    void device.closed.then(cleanup, cleanup).catch(() => {});
+
+    const close = async () => {
+      await closeVirtioDevice(device);
+      await cleanup();
+    };
+    Object.defineProperty(device, "capacity", { value: capacity, enumerable: true });
+    Object.defineProperty(device, "close", { value: close });
+    Object.defineProperty(device, Symbol.asyncDispose, {
+      value: async () => {
+        await close();
+      },
+    });
+    return device as OPFSBlockDevice;
+  } catch (error) {
+    worker.terminate();
+    await prepared.release();
+    throw opfs_block_failure(error);
+  }
 }
 
 const FileType = {

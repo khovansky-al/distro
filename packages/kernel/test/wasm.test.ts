@@ -8,7 +8,12 @@ import { blockDevice } from "../src/virtio/block.ts";
 import { consoleDevice } from "../src/virtio/console.ts";
 import { ethernetDevice, ethernetNetwork } from "../src/virtio/net.ts";
 import { vsockDevice } from "../src/virtio/vsock.ts";
-import { VirtioController, close_virtio_device, virtio_imports } from "../src/virtio/core.ts";
+import {
+  VirtioController,
+  close_virtio_device,
+  virtio_device_description,
+  virtio_imports,
+} from "../src/virtio/core.ts";
 import { serveDevice, workerDevice } from "../src/virtio/remote.ts";
 import {
   allocate_shared_memory,
@@ -231,6 +236,105 @@ test("virtio block reports a short caller-buffer read as IOERR", async () => {
 
   assert.equal(new Uint8Array(block_memory.buffer, 1024, 1)[0], 1);
   await close_virtio_device(device);
+});
+
+test("virtio block advertises and coalesces scatter-gather requests", async () => {
+  const available = 1 << 7;
+  const next = 1;
+  const writable = 1 << 1;
+  const descriptor = (
+    memory: WebAssembly.Memory,
+    index: number,
+    address: number,
+    length: number,
+    flags: number,
+  ) => {
+    const view = new DataView(memory.buffer, index * 16, 16);
+    view.setBigUint64(0, BigInt(address), true);
+    view.setUint32(8, length, true);
+    view.setUint16(12, index, true);
+    view.setUint16(14, flags, true);
+  };
+  const request = (
+    memory: WebAssembly.Memory,
+    type: number,
+    first: number,
+    second: number,
+    status: number,
+  ) => {
+    descriptor(memory, 0, 1024, 16, available | next);
+    descriptor(memory, 1, first, 3, available | next | (type === 0 ? writable : 0));
+    descriptor(memory, 2, second, 2, available | next | (type === 0 ? writable : 0));
+    descriptor(memory, 3, status, 1, available | writable);
+    const header = new DataView(memory.buffer, 1024, 16);
+    header.setUint32(0, type, true);
+    header.setBigUint64(8, 2n, true);
+    new Uint8Array(memory.buffer, status, 1)[0] = 0xff;
+  };
+
+  const writes: { offset: number; data: number[] }[] = [];
+  const writeMemory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+  const writeDevice = blockDevice({
+    capacity: 4096,
+    read() {
+      return 0;
+    },
+    write(offset, data) {
+      writes.push({ offset, data: [...data] });
+      return data.byteLength;
+    },
+  });
+  const description = virtio_device_description(writeDevice);
+  assert.notEqual(description.features & (1n << 2n), 0n);
+  assert.equal(new DataView(description.config.buffer).getUint32(12, true), 128);
+  request(writeMemory, 1, 1100, 1200, 1300);
+  new Uint8Array(writeMemory.buffer, 1100, 3).set([1, 2, 3]);
+  new Uint8Array(writeMemory.buffer, 1200, 2).set([4, 5]);
+  const writeInterrupted = Promise.withResolvers<void>();
+  const writeImports = virtio_imports({
+    memory: writeMemory,
+    devices: [writeDevice],
+    trigger_irq() {
+      writeInterrupted.resolve();
+    },
+    on_error: writeInterrupted.reject,
+  });
+  writeImports.enable_vring(0, 0, 4, 0, 1);
+  writeImports.notify(0, 0);
+  await writeInterrupted.promise;
+  assert.deepEqual(writes, [{ offset: 1024, data: [1, 2, 3, 4, 5] }]);
+  assert.equal(new Uint8Array(writeMemory.buffer, 1300, 1)[0], 0);
+  await close_virtio_device(writeDevice);
+
+  let reads = 0;
+  const readMemory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
+  const readDevice = blockDevice({
+    capacity: 4096,
+    read(offset, target) {
+      reads += 1;
+      assert.equal(offset, 1024);
+      target.set([6, 7, 8, 9, 10]);
+      return target.byteLength;
+    },
+  });
+  request(readMemory, 0, 1100, 1200, 1300);
+  const readInterrupted = Promise.withResolvers<void>();
+  const readImports = virtio_imports({
+    memory: readMemory,
+    devices: [readDevice],
+    trigger_irq() {
+      readInterrupted.resolve();
+    },
+    on_error: readInterrupted.reject,
+  });
+  readImports.enable_vring(0, 0, 4, 0, 1);
+  readImports.notify(0, 0);
+  await readInterrupted.promise;
+  assert.equal(reads, 1);
+  assert.deepEqual([...new Uint8Array(readMemory.buffer, 1100, 3)], [6, 7, 8]);
+  assert.deepEqual([...new Uint8Array(readMemory.buffer, 1200, 2)], [9, 10]);
+  assert.equal(new Uint8Array(readMemory.buffer, 1300, 1)[0], 0);
+  await close_virtio_device(readDevice);
 });
 
 test("console input is held until the guest opens its port", async () => {

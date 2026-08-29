@@ -64,6 +64,7 @@ let
     env.CI = "true";
     pnpmDeps = node-workspace.deps;
     nativeBuildInputs = [
+      pkgs.esbuild
       pkgs.nodejs
       pkgs.pnpmConfigHook
       node-workspace.pnpm
@@ -78,6 +79,12 @@ let
       cp ${agentDisk} packages/linux-guest/agent.img
       pnpm --filter=@lowland/guest check
       pnpm --filter=@lowland/guest build
+      esbuild packages/linux-guest/dist/opfs-block-device-worker.js \
+        --bundle \
+        --format=esm \
+        --platform=browser \
+        --outfile=opfs-block-device-worker.js
+      cp opfs-block-device-worker.js packages/linux-guest/dist/
 
       runHook postBuild
     '';

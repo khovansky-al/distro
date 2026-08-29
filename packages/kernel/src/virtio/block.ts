@@ -2,14 +2,29 @@
 
 import { Struct, U32LE, U64LE } from "@lowland/bytes";
 import { assert } from "../util.ts";
-import { VirtioController, type VirtioDevice, type Virtqueue } from "./core.ts";
+import {
+  VirtioController,
+  type VirtioDevice,
+  type Virtqueue,
+  type VirtqueueBuffer,
+} from "./core.ts";
 
 const BlockDeviceFeatures = {
+  SEG_MAX: 1n << 2n,
   RO: 1n << 5n,
   FLUSH: 1n << 9n,
 } as const;
 
-class BlockDeviceConfig extends Struct({ capacity: U64LE }) {}
+class BlockDeviceConfig extends Struct({
+  capacity: U64LE,
+  sizeMax: U32LE,
+  segMax: U32LE,
+}) {}
+
+// One request may contain a header, this many data descriptors, and a status
+// byte in an indirect descriptor table. Linux independently caps the total
+// request size at 4 MiB, so coalescing cannot allocate an unbounded buffer.
+const BLOCK_DEVICE_SEGMENT_MAXIMUM = 128;
 
 class BlockDeviceRequest extends Struct({
   type: U32LE,
@@ -63,10 +78,42 @@ export interface BlockDeviceStorage {
  */
 export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
   const config = new Uint8Array(BlockDeviceConfig.size);
-  new BlockDeviceConfig(config).capacity = BigInt(storage.capacity / 512);
-  let features = 0n;
+  const blockConfig = new BlockDeviceConfig(config);
+  blockConfig.capacity = BigInt(storage.capacity / 512);
+  blockConfig.segMax = BLOCK_DEVICE_SEGMENT_MAXIMUM;
+  let features = BlockDeviceFeatures.SEG_MAX;
   if (storage.flush) features |= BlockDeviceFeatures.FLUSH;
   if (!storage.write) features |= BlockDeviceFeatures.RO;
+
+  const settle = async <T>(value: MaybePromise<T>) =>
+    typeof (value as PromiseLike<T>)?.then === "function"
+      ? await (value as PromiseLike<T>)
+      : (value as T);
+
+  const request_buffer = (data: VirtqueueBuffer[]) => {
+    if (data.length === 1) return data[0]!.array;
+    const length = data.reduce((total, descriptor) => total + descriptor.array.byteLength, 0);
+    if (!Number.isSafeInteger(length)) throw new RangeError("block request is too large");
+    return new Uint8Array(length);
+  };
+
+  const gather = (data: VirtqueueBuffer[], target: Uint8Array) => {
+    let offset = 0;
+    for (const descriptor of data) {
+      target.set(descriptor.array, offset);
+      offset += descriptor.array.byteLength;
+    }
+  };
+
+  const scatter = (source: Uint8Array, data: VirtqueueBuffer[], length: number) => {
+    let offset = 0;
+    for (const descriptor of data) {
+      const copied = Math.min(descriptor.array.byteLength, length - offset);
+      if (copied <= 0) break;
+      descriptor.array.set(source.subarray(offset, offset + copied));
+      offset += copied;
+    }
+  };
 
   async function notify(queue: Virtqueue) {
     for (const chain of queue) {
@@ -95,18 +142,17 @@ export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
       try {
         switch (request.type) {
           case BlockDeviceRequestType.IN: {
-            let ok = true;
             for (const desc of data) {
               assert(desc.writable, "data must be writable when IN");
-              const read = await storage.read(offset, desc.array);
-              if (read !== desc.array.byteLength) {
-                ok = false;
-                break;
-              }
-              n += read;
-              offset += read;
             }
-            set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
+            const target = request_buffer(data);
+            const read = target.byteLength ? await settle(storage.read(offset, target)) : 0;
+            if (!Number.isSafeInteger(read) || read < 0 || read > target.byteLength) {
+              throw new Error(`invalid block read count: ${read}/${target.byteLength}`);
+            }
+            if (data.length > 1) scatter(target, data, read);
+            n = read;
+            set_status(read === target.byteLength ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
             break;
           }
           case BlockDeviceRequestType.OUT: {
@@ -114,18 +160,19 @@ export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
               set_status(BlockDeviceStatus.UNSUPP);
               break;
             }
-            let ok = true;
             for (const desc of data) {
               assert(!desc.writable, "data must be readonly when OUT");
-              const written = await storage.write(offset, desc.array);
-              if (written !== desc.array.byteLength) {
-                ok = false;
-                break;
-              }
-              n += written;
-              offset += written;
             }
-            set_status(ok ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR);
+            const source = request_buffer(data);
+            if (data.length > 1) gather(data, source);
+            const written = source.byteLength ? await settle(storage.write(offset, source)) : 0;
+            if (!Number.isSafeInteger(written) || written < 0 || written > source.byteLength) {
+              throw new Error(`invalid block write count: ${written}/${source.byteLength}`);
+            }
+            n = written;
+            set_status(
+              written === source.byteLength ? BlockDeviceStatus.OK : BlockDeviceStatus.IOERR,
+            );
             break;
           }
           case BlockDeviceRequestType.FLUSH: {
@@ -133,7 +180,7 @@ export function blockDevice(storage: BlockDeviceStorage): VirtioDevice {
               set_status(BlockDeviceStatus.UNSUPP);
               break;
             }
-            await storage.flush();
+            await settle(storage.flush());
             set_status(BlockDeviceStatus.OK);
             break;
           }

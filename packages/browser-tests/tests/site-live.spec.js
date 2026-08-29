@@ -21,6 +21,21 @@ const test = base.extend({
 async function waitForGuest(page, timeout = 30_000) {
   const terminal = page.locator(".xterm-rows");
   await expect(terminal).toContainText("root@lowland", { timeout });
+  await expect(terminal).toContainText("apk      add curl jq sqlite3, and more", { timeout });
+
+  const rows = await terminal.locator(":scope > div").allTextContents();
+  const bannerStart = rows.findIndex((row) => row.includes("root@lowland"));
+  expect(bannerStart, `terminal rows: ${JSON.stringify(rows)}`).toBeGreaterThanOrEqual(0);
+  const banner = rows.slice(bannerStart, bannerStart + 7);
+  expect(banner).toHaveLength(7);
+  expect(banner[0]).toMatch(/^ {4}\.--\.\s+root@lowland$/);
+  expect(banner[1]).toMatch(/^ {3}\|o_o \|\s+os\s+Linux \S+ wasm$/);
+  expect(banner[2]).toMatch(/^ {3}\|:_\/ \|\s+uptime\s+\d+d \d+h \d+m$/);
+  expect(banner[3]).toMatch(/^ {2}\/\/ {3}\\ \\\s+cpus\s+\d+$/);
+  expect(banner[4]).toMatch(/^ \(\| {5}\| \)\s+memory\s+\d+ MiB \/ \d+ MiB$/);
+  expect(banner[5]).toMatch(/^\/'\\_ {3}_\/`\\\s+shell\s+sh$/);
+  expect(banner[6]).toMatch(/^\\___\)=\(___\/\s+apk\s+add curl jq sqlite3, and more$/);
+
   const input = page.locator(".xterm-helper-textarea");
   await input.pressSequentially(
     "until grep -q ' /boot virtiofs ' /proc/mounts; do sleep 1; done; printf 'boot-%s\\n' mounted",
@@ -76,7 +91,7 @@ test("boots and formats a blank persistent disk into the canonical system", asyn
   await expect(terminal).toContainText("on / type overlay");
 
   await input.pressSequentially(
-    "magic=$(dd if=/dev/vdb bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\n'); test -b /dev/vdb && test \"$magic\" != 53ef && printf 'install-disk-%s\\n' blank",
+    "magic=$(dd if=/dev/vdb bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \\n'); test -b /dev/vdb && test \"$magic\" != 53ef && test \"$(cat /sys/block/vdb/queue/rotational)\" = 0 && test \"$(cat /sys/block/vdb/queue/read_ahead_kb)\" = 128 && grep -q '\\[none\\]' /sys/block/vdb/queue/scheduler && printf 'install-disk-%s\\n' blank",
   );
   await input.press("Enter");
   await expect(terminal).toContainText("install-disk-blank");
@@ -89,7 +104,7 @@ test("boots and formats a blank persistent disk into the canonical system", asyn
   await page.reload();
   const { input: installedInput, terminal: installedTerminal } = await waitForGuest(page);
   await installedInput.pressSequentially(
-    "mount | grep ' on / type ext4 (rw'; test \"$HOME\" = /root && test -d /root; printf 'installed-root-%s\\n' ready",
+    "mount | grep ' on / type ext4 (rw'; root_device=$(awk '$2 == \"/\" { print $1 }' /proc/mounts); root_name=${root_device##*/}; test \"$HOME\" = /root && test -d /root && test \"$(cat /sys/block/$root_name/queue/rotational)\" = 0 && test \"$(cat /sys/block/$root_name/queue/read_ahead_kb)\" = 128 && grep -q '\\[none\\]' /sys/block/$root_name/queue/scheduler && printf 'installed-root-%s\\n' ready",
   );
   await installedInput.press("Enter");
   await expect(installedTerminal).toContainText("on / type ext4 (rw", { timeout: 15_000 });

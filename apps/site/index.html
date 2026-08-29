@@ -152,7 +152,7 @@
         entropyDevice,
         fileSystemDevice,
       } from "@lowland/kernel";
-      import { BrowserFS, openOPFSBlockStorage } from "@lowland/guest/browser";
+      import { BrowserFS, openOPFSBlockDevice } from "@lowland/guest/browser";
       import { serveGuest } from "./static/__ASSET_DIRECTORY__/bridge-client.js";
 
       const searchParameters = new URLSearchParams(location.search);
@@ -386,8 +386,17 @@
       // fills its own virtio console queue instead of buffering inside xterm.
       const toTerminal = (data) => new Promise((resolve) => term.write(data, resolve));
 
+      // The early boot console and hvc0 are separate host streams. Do not let
+      // hvc0 reach xterm until the early stream has closed and drained, or its
+      // delayed kernel log can be replayed through the userspace banner.
+      let releaseTtyConsole;
+      const bootConsoleDrained = new Promise((resolve) => {
+        releaseTtyConsole = resolve;
+      });
+
       const stdout = new WritableStream({
-        write(chunk) {
+        async write(chunk) {
+          await bootConsoleDrained;
           return toTerminal(chunk);
         },
       });
@@ -410,6 +419,14 @@
           return toTerminal(chunk);
         },
       });
+      const bootConsole = {
+        configure() {},
+        booted(machine) {
+          // A first plugin hook runs before guestAgent waits for PID 1, so the
+          // early stream is consumed while the kernel is producing it.
+          void machine.bootConsole.pipeTo(bootOut).then(releaseTtyConsole, releaseTtyConsole);
+        },
+      };
 
       // EROFS requests small, scattered compressed blocks. Fetch larger
       // immutable ranges around them and retain those chunks for the session,
@@ -487,8 +504,7 @@
         }
         if (!requireFilesystem && state.hasFilesystem && !legacyInstallation) return undefined;
         const capacity = provisioning ? provisioning.diskGiB * GiB : undefined;
-        return await openOPFSBlockStorage({
-          directory: state.directory,
+        return await openOPFSBlockDevice({
           name: "root.ext4",
           capacity,
           resize: legacyInstallation,
@@ -536,13 +552,13 @@
       const extraArgs = cmdline.replace(/\+/g, " ");
       if (extraArgs) args.push(extraArgs);
 
-      const plugins = [guest, ttyConsole];
-      if (installDisk) plugins.push(blockDevice(installDisk));
+      const plugins = [bootConsole, guest, ttyConsole];
+      if (installDisk) plugins.push(installDisk);
       plugins.push(entropyDevice());
       if (bootDirectory) {
         plugins.push(fileSystemDevice(new BrowserFS(bootDirectory), { tag: "boot", cache: false }));
       }
-      plugins.push(blockDevice(disk));
+      plugins.push(liveRoot ? blockDevice(disk) : disk);
       plugins.push(networkAttachment);
 
       const machine = await bootMachine({
@@ -552,7 +568,6 @@
         maximumMemoryPages: embedded ? 8192 : undefined,
         maximumUserMemoryPages: embedded ? 4096 : undefined,
       });
-      void machine.bootConsole.pipeTo(bootOut).catch(() => {});
       emitHostEvent("boot-status", { status: "guest-started" });
       if (legacyInstallation) {
         term.write("\r\nChecking and growing the persistent ext4 filesystem...\r\n");

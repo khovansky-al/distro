@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-import { opfsBlockErrorCode } from "./opfs-block-errors.js";
+import { SegmentedOPFSStorage, serializeOPFSBlockError } from "./opfs-block-storage.ts";
 
 interface RequestMessage {
   id: number;
-  type: "init" | "read" | "write" | "flush" | "close";
-  file?: FileSystemFileHandle;
+  type: "init" | "read" | "write" | "flush" | "statistics" | "close";
   directory?: FileSystemDirectoryHandle;
+  originPrivate?: boolean;
   name?: string;
+  create?: boolean;
   capacity?: number;
   segmentSize?: number;
   offset?: number;
@@ -15,148 +16,59 @@ interface RequestMessage {
   data?: ArrayBuffer;
 }
 
-interface ErrorMessage {
-  name: string;
-  message: string;
-  code: string;
-}
-
-let accesses: FileSystemSyncAccessHandle[] = [];
-let capacity = 0;
-let segmentSize = 0;
+let storage: SegmentedOPFSStorage | undefined;
 let operations = Promise.resolve();
-
-function error_message(error: unknown): ErrorMessage {
-  const name = error instanceof DOMException || error instanceof Error ? error.name : "Error";
-  const message = error instanceof Error ? error.message : String(error);
-  const code = opfsBlockErrorCode(error);
-  return { name, message, code };
-}
-
-function checked_range(offset: number | undefined, length: number | undefined) {
-  if (
-    !Number.isSafeInteger(offset) ||
-    !Number.isSafeInteger(length) ||
-    offset! < 0 ||
-    length! < 0 ||
-    offset! + length! > capacity
-  ) {
-    throw new RangeError("block request is outside the OPFS disk");
-  }
-  return { offset: offset!, length: length! };
-}
 
 async function dispatch(message: RequestMessage) {
   let result: Record<string, unknown> = {};
   const transfer: Transferable[] = [];
   switch (message.type) {
     case "init": {
-      if (accesses.length || !message.file || !message.directory || !message.name)
+      if (storage || !message.name)
         throw new DOMException("disk is already open", "InvalidStateError");
-      if (
-        !Number.isSafeInteger(message.capacity) ||
-        message.capacity! <= 0 ||
-        !Number.isSafeInteger(message.segmentSize) ||
-        message.segmentSize! <= 0
-      ) {
-        throw new RangeError("OPFS disk and segment capacities must be positive safe integers");
-      }
-      capacity = message.capacity!;
-      segmentSize = message.segmentSize!;
-      const count = Math.ceil(capacity / segmentSize);
-      try {
-        for (let index = 0; index < count; index++) {
-          const file =
-            index === 0
-              ? message.file
-              : await message.directory.getFileHandle(`${message.name}.part${index}`, {
-                  create: true,
-                });
-          const access = await file.createSyncAccessHandle();
-          accesses.push(access);
-          const expected = Math.min(segmentSize, capacity - index * segmentSize);
-          const current = access.getSize();
-          if (current > expected) {
-            throw new RangeError(
-              `OPFS disk segment ${index} is ${current} bytes, larger than ${expected}`,
-            );
-          }
-          if (current < expected) {
-            access.truncate(expected);
-            access.flush();
-          }
-          if (access.getSize() !== expected) {
-            throw new DOMException(
-              `OPFS disk segment ${index} did not grow to ${expected} bytes`,
-              "QuotaExceededError",
-            );
-          }
-        }
-      } catch (error) {
-        for (const access of accesses) access.close();
-        accesses = [];
-        capacity = 0;
-        segmentSize = 0;
-        throw error;
-      }
-      result = { capacity };
+      storage = await SegmentedOPFSStorage.open({
+        directory: message.directory,
+        originPrivate: message.originPrivate,
+        name: message.name,
+        create: message.create ?? true,
+        capacity: message.capacity!,
+        segmentSize: message.segmentSize!,
+      });
+      result = { capacity: storage.capacity };
       break;
     }
     case "read": {
-      if (!accesses.length) throw new DOMException("disk is closed", "InvalidStateError");
-      const range = checked_range(message.offset, message.length);
-      const data = new Uint8Array(range.length);
-      let position = range.offset;
-      let copied = 0;
-      while (copied < data.byteLength) {
-        const index = Math.floor(position / segmentSize);
-        const offset = position - index * segmentSize;
-        const length = Math.min(data.byteLength - copied, segmentSize - offset);
-        const view = data.subarray(copied, copied + length);
-        const amount = accesses[index]!.read(view, { at: offset });
-        if (amount !== view.byteLength)
-          throw new Error(`short OPFS read: ${amount}/${view.byteLength}`);
-        copied += amount;
-        position += amount;
+      if (!storage) throw new DOMException("disk is closed", "InvalidStateError");
+      if (!Number.isSafeInteger(message.length) || message.length! < 0) {
+        throw new RangeError("block request has an invalid length");
       }
+      const data = new Uint8Array(message.length!);
+      storage.read(message.offset!, data);
       result = { data: data.buffer };
       transfer.push(data.buffer);
       break;
     }
     case "write": {
-      if (!accesses.length || !message.data)
-        throw new DOMException("disk is closed", "InvalidStateError");
+      if (!storage || !message.data) throw new DOMException("disk is closed", "InvalidStateError");
       const data = new Uint8Array(message.data);
-      const range = checked_range(message.offset, data.byteLength);
-      let position = range.offset;
-      let written = 0;
-      while (written < data.byteLength) {
-        const index = Math.floor(position / segmentSize);
-        const offset = position - index * segmentSize;
-        const length = Math.min(data.byteLength - written, segmentSize - offset);
-        const view = data.subarray(written, written + length);
-        const amount = accesses[index]!.write(view, { at: offset });
-        if (amount !== view.byteLength)
-          throw new Error(`short OPFS write: ${amount}/${view.byteLength}`);
-        written += amount;
-        position += amount;
-      }
+      const written = storage.write(message.offset!, data);
       result = { written };
       break;
     }
     case "flush":
-      if (!accesses.length) throw new DOMException("disk is closed", "InvalidStateError");
-      for (const access of accesses) access.flush();
+      if (!storage) throw new DOMException("disk is closed", "InvalidStateError");
+      storage.flush();
       break;
-    case "close":
-      for (const access of accesses) {
-        access.flush();
-        access.close();
-      }
-      accesses = [];
-      capacity = 0;
-      segmentSize = 0;
+    case "statistics":
+      if (!storage) throw new DOMException("disk is closed", "InvalidStateError");
+      result = { statistics: storage.statistics() };
       break;
+    case "close": {
+      const opened = storage;
+      storage = undefined;
+      opened?.close();
+      break;
+    }
   }
   postMessage({ id: message.id, ok: true, ...result }, transfer);
 }
@@ -166,6 +78,6 @@ addEventListener("message", (event: MessageEvent<RequestMessage>) => {
   operations = operations
     .then(() => dispatch(message))
     .catch((error) => {
-      postMessage({ id: message.id, ok: false, error: error_message(error) });
+      postMessage({ id: message.id, ok: false, error: serializeOPFSBlockError(error) });
     });
 });

@@ -188,30 +188,37 @@ Use a worker-owned OPFS logical disk when Linux needs a complete persistent
 block device, including ext4 semantics:
 
 ```js
-import { blockDevice, bootMachine } from "@lowland/kernel";
+import { bootMachine } from "@lowland/kernel";
 import { guestAgent } from "@lowland/guest";
-import { openOPFSBlockStorage } from "@lowland/guest/browser";
+import { openOPFSBlockDevice } from "@lowland/guest/browser";
 
-const disk = await openOPFSBlockStorage({
+const disk = await openOPFSBlockDevice({
   name: "root.ext4",
   capacity: 8 * 1024 ** 3,
 });
 const guest = guestAgent();
 await using machine = await bootMachine({
   cpus: 1,
-  plugins: [guest, blockDevice(disk)],
+  plugins: [guest, disk],
 });
 ```
 
-The adapter keeps its `FileSystemSyncAccessHandle`s in a dedicated worker and
-copies only requested ranges across the worker boundary. Large logical disks
+The adapter keeps its `FileSystemSyncAccessHandle`s and virtio request handling
+in the same dedicated worker, so normal block data does not make an extra
+worker-to-main-thread round trip. Large logical disks
 are split into bounded OPFS implementation files, but callers and Linux see one
 contiguous block device; the complete disk is never read into a JavaScript
-array. Operations are serialized, flush maps to the access handles, quota
+array. With the default origin-private directory, the worker opens OPFS itself
+so filesystem handles do not have to be structured-cloned across the worker
+boundary (which Safari does not support). An explicitly supplied `directory`
+still requires a browser that can clone `FileSystemDirectoryHandle` values.
+Operations are serialized, flush maps to the access handles, quota
 failures surface as block I/O failures, and an origin-wide exclusive Web Lock
 prevents a second tab from opening the same disk. Closing the machine flushes
 and closes the handles and releases that lock. Pass `resize: true` with a
 larger `capacity` to extend an existing disk; the adapter never shrinks one.
+`openOPFSBlockStorage` remains available for callers that specifically need the
+lower-level asynchronous storage interface instead of a virtio device.
 
 ## License
 

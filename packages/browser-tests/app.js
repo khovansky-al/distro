@@ -1,14 +1,9 @@
-import {
-  blockDevice,
-  bootMachine,
-  consoleDevice,
-  fileSystemDevice,
-  workerDevice,
-} from "@lowland/kernel";
+import { blockDevice, bootMachine, consoleDevice, fileSystemDevice } from "@lowland/kernel";
 import { createNetwork, guestAgent, webSocketNetwork } from "@lowland/guest";
 import {
   BrowserFS,
   OPFSBlockStorageError,
+  openOPFSBlockDevice,
   openOPFSBlockStorage,
   opfsBlockErrorCode,
 } from "@lowland/guest/browser";
@@ -39,21 +34,8 @@ async function rootDevice() {
   });
 }
 
-async function opfsDiskDevice(handle, capacity) {
-  const worker = new Worker("/opfs-disk-worker.js", { type: "module" });
-  const devicePromise = workerDevice(worker);
-  worker.postMessage({
-    handle,
-    capacity,
-  });
-  try {
-    const device = await devicePromise;
-    void device.closed.finally(() => worker.terminate()).catch(() => {});
-    return device;
-  } catch (error) {
-    worker.terminate();
-    throw error;
-  }
+async function opfsDiskDevice(name, capacity) {
+  return await openOPFSBlockDevice({ name, ...(capacity === undefined ? {} : { capacity }) });
 }
 
 // Boots a guest, runs the scenario, and always shuts the machine down.
@@ -87,41 +69,58 @@ globalThis.bootSmoke = () =>
 globalThis.opfsWorkerDiskRoundTrip = async () => {
   const directory = await navigator.storage.getDirectory();
   const name = "virtio-worker-round-trip.img";
-  await directory.removeEntry(name).catch((error) => {
-    if (error.name !== "NotFoundError") throw error;
-  });
-  const handle = await directory.getFileHandle(name, { create: true });
+  const removeDisk = async () => {
+    await directory.removeEntry(name).catch(() => {});
+    await directory.removeEntry(`${name}.metadata`).catch(() => {});
+    for (let index = 1; ; index++) {
+      try {
+        await directory.removeEntry(`${name}.part${index}`);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError") break;
+        throw error;
+      }
+    }
+  };
+  await removeDisk();
   const marker = "opfs-worker-virtio-round-trip";
+  const offset = 256 * 1024 ** 2 + 4096;
 
   try {
-    const first = await opfsDiskDevice(handle, 1024 * 1024);
+    const first = await opfsDiskDevice(name, 300 * 1024 ** 2);
+    const locked = await opfsDiskDevice(name).then(
+      async (device) => {
+        await device.close();
+        return "opened";
+      },
+      (error) => (error instanceof OPFSBlockStorageError ? error.code : `${error}`),
+    );
     const write = await withGuest(
       async (guest) =>
         collectProcess(
           await guest.exec([
             "sh",
             "-c",
-            `until [ -b /dev/vdb ]; do sleep 0.1; done; printf '%s\\n' '${marker}' | dd of=/dev/vdb bs=512 conv=fsync 2>/dev/null`,
+            `until [ -b /dev/vdb ]; do sleep 0.1; done; printf '%s\\n' '${marker}' | dd of=/dev/vdb bs=1 seek=${offset} conv=fsync 2>/dev/null`,
           ]),
         ),
       { devices: [first] },
     );
 
-    const second = await opfsDiskDevice(handle);
+    const second = await opfsDiskDevice(name);
     const read = await withGuest(
       async (guest) =>
         collectProcess(
           await guest.exec([
             "sh",
             "-c",
-            "until [ -b /dev/vdb ]; do sleep 0.1; done; dd if=/dev/vdb bs=512 count=1 2>/dev/null | head -n 1",
+            `until [ -b /dev/vdb ]; do sleep 0.1; done; dd if=/dev/vdb bs=1 skip=${offset} count=${marker.length + 1} 2>/dev/null`,
           ]),
         ),
       { devices: [second] },
     );
-    return { marker, write, read };
+    return { locked, marker, offset, write, read };
   } finally {
-    await directory.removeEntry(name);
+    await removeDisk();
   }
 };
 
@@ -617,12 +616,12 @@ globalThis.opfsBlockStorage = async () => {
     for (let offset = 0; offset < data.length; offset++) data[offset] = (offset + index * 31) % 251;
     return { position, data };
   });
-  const storage = await openOPFSBlockStorage({ directory, name, capacity });
+  const storage = await openOPFSBlockStorage({ name, capacity });
   let locked;
   try {
     await Promise.all(expected.map(({ position, data }) => storage.write(position, data)));
     await storage.flush();
-    locked = await openOPFSBlockStorage({ directory, name }).then(
+    locked = await openOPFSBlockStorage({ name }).then(
       () => "opened",
       (error) => (error instanceof OPFSBlockStorageError ? error.code : `${error}`),
     );
@@ -630,7 +629,7 @@ globalThis.opfsBlockStorage = async () => {
     await storage.close();
   }
 
-  const reopened = await openOPFSBlockStorage({ directory, name });
+  const reopened = await openOPFSBlockStorage({ name });
   try {
     const reads = await Promise.all(
       expected.map(async ({ position, data }) => {
